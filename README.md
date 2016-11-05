@@ -28,6 +28,7 @@ config GENERIC.MP
 cd ../compile/GENERIC.MP 
 make -jX
 make install
+cp cp /usr/src/sys/arch/amd64/include/kvm.h /usr/include/machine/kvm.h
 ```
 
 Reboot, and compile the qemu port with the patch:
