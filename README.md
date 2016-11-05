@@ -35,3 +35,10 @@ Reboot, and compile the qemu port with the patch:
 add --enable-kvm \ in CONFIGURE_ARGS= in Makefile
   make -jX
   make install
+
+Create the device nodes:
+  cd /dev
+  mknod kvm c 97 0
+  mknod kvm_vm c 97 1
+  mknod kvm_vcpu c 97 2
+
