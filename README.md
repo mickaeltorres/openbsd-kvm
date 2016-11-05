@@ -20,7 +20,8 @@ Known caveats:
 
 Compile the kernel with the patch:
 
-```cd /usr/src/sys
+```
+cd /usr/src/sys
 patch < /path/to/kernel_patch
 cd arch/amd64/conf 
 config GENERIC.MP
@@ -31,7 +32,8 @@ make install
 
 Reboot, and compile the qemu port with the patch:
 
-```cp /path/to/qemu_patch /usr/ports/emulators/qemu/patches/patch-kvm
+```
+cp /path/to/qemu_patch /usr/ports/emulators/qemu/patches/patch-kvm
 cd /usr/ports/emulators/qemu
 add --enable-kvm \ in CONFIGURE_ARGS= in Makefile
 make -jX
@@ -40,7 +42,8 @@ make install
 
 Create the device nodes:
 
-```cd /dev
+```
+cd /dev
 mknod kvm c 97 0
 mknod kvm_vm c 97 1
 mknod kvm_vcpu c 97 2
