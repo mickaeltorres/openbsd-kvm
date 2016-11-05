@@ -1,0 +1,409 @@
+--- hw/i386/kvm/clock.c	Sat Nov  5 11:16:45 2016
++++ hw/i386/kvm/clock.c	Sat Nov  5 19:16:14 2016
+@@ -22,8 +22,7 @@
+ #include "hw/sysbus.h"
+ #include "hw/kvm/clock.h"
+ 
+-#include <linux/kvm.h>
+-#include <linux/kvm_para.h>
++#include <machine/kvm.h>
+ 
+ #define TYPE_KVM_CLOCK "kvmclock"
+ #define KVM_CLOCK(obj) OBJECT_CHECK(KVMClockState, (obj), TYPE_KVM_CLOCK)
+--- include/sysemu/kvm.h  Wed May 11 17:56:11 2016
++++ include/sysemu/kvm.h     Sat Nov  5 19:16:34 2016
+@@ -20,8 +20,7 @@
+ #include "hw/irq.h"
+ 
+ #ifdef CONFIG_KVM
+-#include <linux/kvm.h>
+-#include <linux/kvm_para.h>
++#include <machine/kvm.h>
+ #else
+ /* These constants must never be used at runtime if kvm_enabled() is false.
+  * They exist so we don't need #ifdefs around KVM-specific code that already
+@@ -241,11 +240,11 @@
+ 
+ /* internal API */
+ 
+-int kvm_ioctl(KVMState *s, int type, ...);
++int kvm_ioctl(KVMState *s, unsigned long type, ...);
+ 
+-int kvm_vm_ioctl(KVMState *s, int type, ...);
++int kvm_vm_ioctl(KVMState *s, unsigned long type, ...);
+ 
+-int kvm_vcpu_ioctl(CPUState *cpu, int type, ...);
++int kvm_vcpu_ioctl(CPUState *cpu, unsigned long type, ...);
+ 
+ /**
+  * kvm_device_ioctl - call an ioctl on a kvm device
+@@ -254,7 +253,7 @@
+  *
+  * Returns: -errno on error, nonnegative on success
+  */
+-int kvm_device_ioctl(int fd, int type, ...);
++int kvm_device_ioctl(int fd, unsigned long type, ...);
+ 
+ /**
+  * kvm_vm_check_attr - check for existence of a specific vm attribute
+--- hw/misc/hyperv_testdev.c	Sat Nov  5 11:16:45 2016
++++ hw/misc/hyperv_testdev.c	Sat Nov  5 19:16:15 2016
+@@ -15,8 +15,8 @@
+ #include "hw/hw.h"
+ #include "hw/qdev.h"
+ #include "hw/isa/isa.h"
++#include <machine/kvm.h>
+ #include "sysemu/kvm.h"
+-#include "linux/kvm.h"
+ #include "target-i386/hyperv.h"
+ #include "kvm_i386.h"
+ 
+--- kvm-all.c	Sat Nov  5 11:16:45 2016
++++ kvm-all.c	Sat Nov  5 20:41:00 2016
+@@ -17,7 +17,7 @@
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+ 
+-#include <linux/kvm.h>
++#include <machine/kvm.h>
+ 
+ #include "qemu-common.h"
+ #include "qemu/atomic.h"
+@@ -1934,7 +1934,7 @@
+     return ret;
+ }
+ 
+-int kvm_ioctl(KVMState *s, int type, ...)
++int kvm_ioctl(KVMState *s, unsigned long type, ...)
+ {
+     int ret;
+     void *arg;
+@@ -1947,12 +1947,13 @@
+     trace_kvm_ioctl(type, arg);
+     ret = ioctl(s->fd, type, arg);
+     if (ret == -1) {
+-        ret = -errno;
++        ret = errno;
++        errno = -errno;
+     }
+     return ret;
+ }
+ 
+-int kvm_vm_ioctl(KVMState *s, int type, ...)
++int kvm_vm_ioctl(KVMState *s, unsigned long type, ...)
+ {
+     int ret;
+     void *arg;
+@@ -1965,12 +1966,13 @@
+     trace_kvm_vm_ioctl(type, arg);
+     ret = ioctl(s->vmfd, type, arg);
+     if (ret == -1) {
+-        ret = -errno;
++        ret = errno;
++        errno = -errno;
+     }
+     return ret;
+ }
+ 
+-int kvm_vcpu_ioctl(CPUState *cpu, int type, ...)
++int kvm_vcpu_ioctl(CPUState *cpu, unsigned long type, ...)
+ {
+     int ret;
+     void *arg;
+@@ -1983,12 +1985,13 @@
+     trace_kvm_vcpu_ioctl(cpu->cpu_index, type, arg);
+     ret = ioctl(cpu->kvm_fd, type, arg);
+     if (ret == -1) {
+-        ret = -errno;
++        ret = errno;
++        errno = -errno;
+     }
+     return ret;
+ }
+ 
+-int kvm_device_ioctl(int fd, int type, ...)
++int kvm_device_ioctl(int fd, unsigned long type, ...)
+ {
+     int ret;
+     void *arg;
+@@ -2001,7 +2004,8 @@
+     trace_kvm_device_ioctl(fd, type, arg);
+     ret = ioctl(fd, type, arg);
+     if (ret == -1) {
+-        ret = -errno;
++        ret = errno;
++        errno = -errno;
+     }
+     return ret;
+ }
+--- target-i386/cpu.c	Sat Nov  5 11:16:49 2016
++++ target-i386/cpu.c	Sat Nov  5 19:16:34 2016
+@@ -36,7 +36,7 @@
+ 
+ #include "hw/hw.h"
+ #if defined(CONFIG_KVM)
+-#include <linux/kvm_para.h>
++#include <machine/kvm.h>
+ #endif
+ 
+ #include "sysemu/sysemu.h"
+--- target-i386/kvm.c	Sat Nov  5 11:16:49 2016
++++ target-i386/kvm.c	Sat Nov  5 20:44:02 2016
+@@ -18,8 +18,7 @@
+ #include <sys/mman.h>
+ #include <sys/utsname.h>
+ 
+-#include <linux/kvm.h>
+-#include <linux/kvm_para.h>
++#include <machine/kvm.h>
+ 
+ #include "qemu-common.h"
+ #include "sysemu/sysemu.h"
+@@ -122,17 +121,14 @@
+ {
+     X86CPU *cpu = X86_CPU(cs);
+     CPUX86State *env = &cpu->env;
+-    struct {
+-        struct kvm_msrs info;
+-        struct kvm_msr_entry entries[1];
+-    } msr_data;
++    struct kvm_msrs msr_data;
+     int ret;
+ 
+     if (env->tsc_valid) {
+         return 0;
+     }
+ 
+-    msr_data.info.nmsrs = 1;
++    msr_data.nmsrs = 1;
+     msr_data.entries[0].index = MSR_IA32_TSC;
+     env->tsc_valid = !runstate_is_running();
+ 
+@@ -169,9 +165,15 @@
+     struct kvm_cpuid2 *cpuid;
+     int r, size;
+ 
+-    size = sizeof(*cpuid) + max * sizeof(*cpuid->entries);
++    size = sizeof(*cpuid);
++    if (max != 1)
++    {
++        fprintf(stderr, "KVM_GET_SUPPORTED_CPUID failed: %s\n",
++                strerror(EFAULT));
++        exit(1);
++    }
+     cpuid = g_malloc0(size);
+-    cpuid->nent = max;
++    cpuid->nent = max = 32;
+     r = kvm_ioctl(s, KVM_GET_SUPPORTED_CPUID, cpuid);
+     if (r == 0 && cpuid->nent >= max) {
+         r = -E2BIG;
+@@ -566,14 +568,11 @@
+ 
+ static Error *invtsc_mig_blocker;
+ 
+-#define KVM_MAX_CPUID_ENTRIES  100
++#define KVM_MAX_CPUID_ENTRIES  32
+ 
+ int kvm_arch_init_vcpu(CPUState *cs)
+ {
+-    struct {
+-        struct kvm_cpuid2 cpuid;
+-        struct kvm_cpuid_entry2 entries[KVM_MAX_CPUID_ENTRIES];
+-    } QEMU_PACKED cpuid_data;
++    struct kvm_cpuid2 cpuid_data;
+     X86CPU *cpu = X86_CPU(cs);
+     CPUX86State *env = &cpu->env;
+     uint32_t limit, i, j, cpuid_i;
+@@ -831,7 +830,7 @@
+         }
+     }
+ 
+-    cpuid_data.cpuid.nent = cpuid_i;
++    cpuid_data.nent = cpuid_i;
+ 
+     if (((env->cpuid_version >> 8)&0xF) >= 6
+         && (env->features[FEAT_1_EDX] & (CPUID_MCE | CPUID_MCA)) ==
+@@ -869,13 +868,13 @@
+ 
+     qemu_add_vm_change_state_handler(cpu_update_state, env);
+ 
+-    c = cpuid_find_entry(&cpuid_data.cpuid, 1, 0);
++    c = cpuid_find_entry(&cpuid_data, 1, 0);
+     if (c) {
+         has_msr_feature_control = !!(c->ecx & CPUID_EXT_VMX) ||
+                                   !!(c->ecx & CPUID_EXT_SMX);
+     }
+ 
+-    c = cpuid_find_entry(&cpuid_data.cpuid, 0x80000007, 0);
++    c = cpuid_find_entry(&cpuid_data, 0x80000007, 0);
+     if (c && (c->edx & 1<<8) && invtsc_mig_blocker == NULL) {
+         /* for migration */
+         error_setg(&invtsc_mig_blocker,
+@@ -886,7 +885,7 @@
+         vmstate_x86_cpu.unmigratable = 1;
+     }
+ 
+-    cpuid_data.cpuid.padding = 0;
++    cpuid_data.padding = 0;
+     r = kvm_vcpu_ioctl(cs, KVM_SET_CPUID2, &cpuid_data);
+     if (r) {
+         return r;
+@@ -1108,7 +1107,7 @@
+     }
+ 
+     uname(&utsname);
+-    lm_capable_kernel = strcmp(utsname.machine, "x86_64") == 0;
++    lm_capable_kernel = strcmp(utsname.machine, "amd64") == 0;
+ 
+     /*
+      * On older Intel CPUs, KVM uses vm86 mode to emulate 16-bit code directly.
+@@ -1214,7 +1213,7 @@
+     }
+ }
+ 
+-static void kvm_getput_reg(__u64 *kvm_reg, target_ulong *qemu_reg, int set)
++static void kvm_getput_reg(u_int64_t *kvm_reg, target_ulong *qemu_reg, int set)
+ {
+     if (set) {
+         *kvm_reg = *qemu_reg;
+@@ -1442,10 +1441,7 @@
+ static int kvm_put_tscdeadline_msr(X86CPU *cpu)
+ {
+     CPUX86State *env = &cpu->env;
+-    struct {
+-        struct kvm_msrs info;
+-        struct kvm_msr_entry entries[1];
+-    } msr_data;
++    struct kvm_msrs msr_data;
+     struct kvm_msr_entry *msrs = msr_data.entries;
+     int ret;
+ 
+@@ -1455,16 +1451,13 @@
+ 
+     kvm_msr_entry_set(&msrs[0], MSR_IA32_TSCDEADLINE, env->tsc_deadline);
+ 
+-    msr_data.info = (struct kvm_msrs) {
+-        .nmsrs = 1,
+-    };
++    msr_data.nmsrs = 1;
+ 
+     ret = kvm_vcpu_ioctl(CPU(cpu), KVM_SET_MSRS, &msr_data);
+     if (ret < 0) {
+         return ret;
+     }
+ 
+-    assert(ret == 1);
+     return 0;
+ }
+ 
+@@ -1476,39 +1469,30 @@
+  */
+ static int kvm_put_msr_feature_control(X86CPU *cpu)
+ {
+-    struct {
+-        struct kvm_msrs info;
+-        struct kvm_msr_entry entry;
+-    } msr_data;
++    struct kvm_msrs msr_data;
+     int ret;
+ 
+     if (!has_msr_feature_control) {
+         return 0;
+     }
+ 
+-    kvm_msr_entry_set(&msr_data.entry, MSR_IA32_FEATURE_CONTROL,
++    kvm_msr_entry_set(msr_data.entries, MSR_IA32_FEATURE_CONTROL,
+                       cpu->env.msr_ia32_feature_control);
+ 
+-    msr_data.info = (struct kvm_msrs) {
+-        .nmsrs = 1,
+-    };
+-
++    msr_data.nmsrs = 1;
++    
+     ret = kvm_vcpu_ioctl(CPU(cpu), KVM_SET_MSRS, &msr_data);
+     if (ret < 0) {
+         return ret;
+     }
+ 
+-    assert(ret == 1);
+     return 0;
+ }
+ 
+ static int kvm_put_msrs(X86CPU *cpu, int level)
+ {
+     CPUX86State *env = &cpu->env;
+-    struct {
+-        struct kvm_msrs info;
+-        struct kvm_msr_entry entries[150];
+-    } msr_data;
++    struct kvm_msrs msr_data;
+     struct kvm_msr_entry *msrs = msr_data.entries;
+     int n = 0, i;
+     int ret;
+@@ -1701,16 +1685,13 @@
+         }
+     }
+ 
+-    msr_data.info = (struct kvm_msrs) {
+-        .nmsrs = n,
+-    };
++    msr_data.nmsrs = n;
+ 
+     ret = kvm_vcpu_ioctl(CPU(cpu), KVM_SET_MSRS, &msr_data);
+     if (ret < 0) {
+         return ret;
+     }
+ 
+-    assert(ret == n);
+     return 0;
+ }
+ 
+@@ -1923,13 +1904,13 @@
+ static int kvm_get_msrs(X86CPU *cpu)
+ {
+     CPUX86State *env = &cpu->env;
+-    struct {
+-        struct kvm_msrs info;
+-        struct kvm_msr_entry entries[150];
+-    } msr_data;
+-    struct kvm_msr_entry *msrs = msr_data.entries;
++    struct kvm_msrs *msr_data;
++    struct kvm_msr_entry *msrs;
+     int ret, i, n;
+ 
++    msr_data = malloc(sizeof(*msr_data));
++    msrs = msr_data->entries;
++    
+     n = 0;
+     msrs[n++].index = MSR_IA32_SYSENTER_CS;
+     msrs[n++].index = MSR_IA32_SYSENTER_ESP;
+@@ -2071,17 +2052,15 @@
+         }
+     }
+ 
+-    msr_data.info = (struct kvm_msrs) {
+-        .nmsrs = n,
+-    };
++    msr_data->nmsrs = n;
+ 
+-    ret = kvm_vcpu_ioctl(CPU(cpu), KVM_GET_MSRS, &msr_data);
++    ret = kvm_vcpu_ioctl(CPU(cpu), KVM_GET_MSRS, msr_data);
+     if (ret < 0) {
++        free(msr_data);
+         return ret;
+     }
+ 
+-    assert(ret == n);
+-    for (i = 0; i < ret; i++) {
++    for (i = 0; i < n; i++) {
+         uint32_t index = msrs[i].index;
+         switch (index) {
+         case MSR_IA32_SYSENTER_CS:
+@@ -2284,6 +2263,7 @@
+         }
+     }
+ 
++    free(msr_data);
+     return 0;
+ }
