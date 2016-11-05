@@ -1,21 +1,25 @@
 # openbsd-kvm
 Quick and dirty port of the KVM API to OpenBSD, plus small changes to the qemu port to use it
 
+
+## This code is completely un-finished and un-polished, use at your own risks
+
+
 Has been tested on OpenBSD 6.0-stable on the following CPUs:
  - amd a8-7600
  - intel i7-4600u
  - intel i7-4770k
 
 The following guests have been tested:
- - OpenBSD 6.0 amd64
- - FreeBSD 11.0-RC3 amd64
- - Debian 8.6.0 amd64
+ - OpenBSD 6.0 amd64: installs / works
+ - FreeBSD 11.0-RC3 amd64: installs / works without -M q35
+ - Debian 8.6.0 amd64: installs / works
 
 Known caveats:
  - only one vCPU supported
  - quick and dirty code :D
  - the IO/MMIO instruction emulation is, at best, a hack
- - sometimes to install debian on intel CPU, it is needed to kill a process
+ - sometimes to install debian on intel CPU, it is needed to kill a modprobe btrfs process
  - text and VGA console doesn't refresh well, the culprit would be, IO/MMIO emulation and/or the KVM_GET_DIRTY_LOG ioctl
  - ...
 
