@@ -10,6 +10,16 @@
  
  #define TYPE_KVM_CLOCK "kvmclock"
  #define KVM_CLOCK(obj) OBJECT_CHECK(KVMClockState, (obj), TYPE_KVM_CLOCK)
+--- hw/i386/kvm/apic.c    Wed May 11 17:56:08 2016
++++ hw/i386/kvm/apic.c       Sat Nov  5 22:56:49 2016
+@@ -10,6 +10,7 @@
+  * See the COPYING file in the top-level directory.
+  */
+ #include "qemu/osdep.h"
++#include <sys/ioctl.h>
+ #include "hw/i386/apic_internal.h"
+ #include "hw/pci/msi.h"
+ #include "sysemu/kvm.h"
 --- include/sysemu/kvm.h  Wed May 11 17:56:11 2016
 +++ include/sysemu/kvm.h     Sat Nov  5 19:16:34 2016
 @@ -20,8 +20,7 @@
