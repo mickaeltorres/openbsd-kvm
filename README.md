@@ -16,6 +16,7 @@ Known caveats:
  - quick and dirty code :D
  - the IO/MMIO instruction emulation is, at best, a hack
  - sometimes to install debian on intel CPU, it is needed to kill a process
+ - text and VGA console doesn't refresh well, the culprit would be, IO/MMIO emulation and/or the KVM_GET_DIRTY_LOG ioctl
  - ...
 
 Compile the kernel with the patch:
@@ -49,3 +50,11 @@ mknod kvm c 97 0
 mknod kvm_vm c 97 1
 mknod kvm_vcpu c 97 2
 ```
+
+You should be able to start, and install guests like this:
+
+```
+qemu-system-x86_64 -enable-kvm -cpu host -boot d -cdrom iso -m 512 -netdev user,id=vionet -device virtio-net,netdev=vionet -drive file=disk,if=virtio,format=raw -M q35
+```
+
+Adapt as you see fit, FreeBSD is known to panic with -M q35, so remove this for that type of guests
