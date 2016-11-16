@@ -1,84 +1,7 @@
---- arch/amd64/amd64/autoconf.c	Sat Nov  5 11:17:44 2016
-+++ arch/amd64/amd64/autoconf.c	Sat Nov  5 11:16:32 2016
-@@ -105,6 +105,9 @@
- extern int	amd64_has_aesni;
- #endif
- 
-+void		svm_setup(void);
-+void		vmx_setup(void);
-+
- /*
-  * Determine i/o configuration for a machine.
-  */
-@@ -154,6 +157,8 @@
- 	if (amd64_has_aesni)
- 		aesni_setup();
- #endif
-+	svm_setup();
-+	vmx_setup();
- }
- 
- void
---- arch/amd64/amd64/conf.c	Sat Nov  5 11:17:44 2016
-+++ arch/amd64/amd64/conf.c	Sat Nov  5 11:16:32 2016
-@@ -112,6 +112,12 @@
- 	(dev_type_stop((*))) enodev, 0, seltrue, \
- 	(dev_type_mmap((*))) enodev }
- 
-+/* open, close, ioctl, mmap */
-+#define cdev_kvm_init(c,n) {						\
-+    dev_init(c,n,open), dev_init(c,n,close),				\
-+      (dev_type_read((*))) enodev, (dev_type_write((*))) enodev,	\
-+      dev_init(c,n,ioctl), (dev_type_stop((*))) enodev, 0, seltrue, 	\
-+      dev_init(c,n,mmap) }
- 
- #define	mmread	mmrw
- #define	mmwrite	mmrw
-@@ -164,6 +170,8 @@
- cdev_decl(drm);
- #include "viocon.h"
- cdev_decl(viocon);
-+#include "kvm.h"
-+cdev_decl(kvm);
- 
- #include "wsdisplay.h"
- #include "wskbd.h"
-@@ -295,6 +303,7 @@
- 	cdev_tty_init(NVIOCON,viocon),  /* 94: virtio console */
- 	cdev_pvbus_init(NPVBUS,pvbus),	/* 95: pvbus(4) control interface */
- 	cdev_ipmi_init(NIPMI,ipmi),	/* 96: ipmi */
-+	cdev_kvm_init(NKVM,kvm),        /* 97: kvm */
- };
- int	nchrdev = nitems(cdevsw);
- 
---- arch/amd64/amd64/cpu.c	Sat Nov  5 11:17:44 2016
-+++ arch/amd64/amd64/cpu.c	Sat Nov  5 11:16:32 2016
-@@ -659,6 +659,9 @@
- 	}
- }
- 
-+void svm_enter(void);
-+void vmx_enter(void);
-+
- /*
-  * The CPU ends up here when it's ready to run
-  * This is called from code in mptramp.s; at this point, we are running
-@@ -736,6 +739,12 @@
- 	nanouptime(&ci->ci_schedstate.spc_runtime);
- 	splx(s);
- 
-+	// setup SVM for this AP
-+	svm_enter();
-+	
-+	// setup VMX for this AP
-+	vmx_enter();
-+	
- 	SCHED_LOCK(s);
- 	cpu_switchto(NULL, sched_chooseproc());
- }
---- arch/amd64/amd64/kvm.c	Thu Jan  1 01:00:00 1970
-+++ arch/amd64/amd64/kvm.c	Sat Nov  5 20:54:22 2016
-@@ -0,0 +1,2172 @@
+diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64/amd64/kvm.c
+--- stable-tree/src/sys/arch/amd64/amd64/kvm.c  Thu Jan  1 01:00:00 1970
++++ kvm-tree/src/sys/arch/amd64/amd64/kvm.c	Wed Nov 16 11:41:18 2016
+@@ -0,0 +1,2206 @@
 +/*
 + * Copyright (c) 2016 Mickael Torres
 + * All rights reserved.
@@ -325,96 +248,130 @@
 +  paddr_t ga;
 +  vaddr_t ha;
 +  paddr_t pa;
++  u_int32_t pml4e;
++  u_int32_t pdpte;
++  u_int32_t pde;
 +
 +  gaddr &= 0xfffffffffffff000;
 +  haddr &= 0xfffffffffffff000;
 +
++  pml4e = 0xffffffff;
++  pdpte = 0xffffffff;
++  pde = 0xffffffff;
++  
 +  for (ga = gaddr, ha = haddr; ga < (gaddr + size);
 +       ga += PAGE_SIZE, ha += PAGE_SIZE)
 +  {
-+    // check if the pml4e exists
-+    if (!*(u_int64_t *)(kp->vpml4 + KVM_G2PML4E(ga)))
++    // check if we already have the vpdpt
++    if (pml4e != KVM_G2PML4E(ga))
 +    {
-+      // create a new EPT-PDPT
-+      vpdpt = uvm_km_zalloc(kernel_map, PAGE_SIZE);
-+      pmap_extract(pmap_kernel(), vpdpt, &ppdpt);
-+      *(u_int64_t *)(kp->vpml4 + KVM_G2PML4E(ga)) = ppdpt | KVM_RWX;
-+      // add the entry to the page list
-+      v = malloc(sizeof(struct v_kvm_vpage), M_MEMDESC, M_WAITOK);
-+      v->vp = vpdpt;
-+      v->pp = ppdpt;
-+      SLIST_INSERT_HEAD(&kp->vp, v, next);
++      pml4e = KVM_G2PML4E(ga);
++      pdpte = 0xffffffff;
++      pde = 0xffffffff;
++      // check if the pml4e exists
++      if (!*(u_int64_t *)(kp->vpml4 + KVM_G2PML4E(ga)))
++      {
++	// if we want to unmap, and the pml4e doesn't exist, just exit
++	if (unmap)
++	  return (0);
++	// create a new EPT-PDPT
++	vpdpt = uvm_km_zalloc(kernel_map, PAGE_SIZE);
++	pmap_extract(pmap_kernel(), vpdpt, &ppdpt);
++	*(u_int64_t *)(kp->vpml4 + KVM_G2PML4E(ga)) = ppdpt | KVM_RWX;
++	// add the entry to the page list
++	v = malloc(sizeof(struct v_kvm_vpage), M_MEMDESC, M_WAITOK);
++	v->vp = vpdpt;
++	v->pp = ppdpt;
++	SLIST_INSERT_HEAD(&kp->vp, v, next);
++      }
++      else
++      {
++	vpdpt = 0;
++	// find the pdpt vaddr
++	SLIST_FOREACH(v, &kp->vp, next)
++	  if (v->pp == (*(u_int64_t *)(kp->vpml4 + KVM_G2PML4E(ga)) &
++			0xfffffffffffff000))
++	  {
++	    vpdpt = v->vp;
++	    break;
++	  }
++      }
++      if (!vpdpt)
++	return (EFAULT);
 +    }
-+    else
-+    {
-+      vpdpt = 0;
-+      // find the pdpt vaddr
-+      SLIST_FOREACH(v, &kp->vp, next)
-+	if (v->pp == (*(u_int64_t *)(kp->vpml4 + KVM_G2PML4E(ga)) &
-+		      0xfffffffffffff000))
-+	{
-+	  vpdpt = v->vp;
-+	  break;
-+	}
-+    }
-+    if (!vpdpt)
-+      return (EFAULT);
-+    
-+    // check if the pdpte exists
-+    if (!*(u_int64_t *)(vpdpt + KVM_G2PDPTE(ga)))
-+    {
-+      // create a new EPT-PD
-+      vpd = uvm_km_zalloc(kernel_map, PAGE_SIZE);
-+      pmap_extract(pmap_kernel(), vpd, &ppd);
-+      *(u_int64_t *)(vpdpt + KVM_G2PDPTE(ga)) = ppd | KVM_RWX;
-+      // add the entry to the page list
-+      v = malloc(sizeof(struct v_kvm_vpage), M_MEMDESC, M_WAITOK);
-+      v->vp = vpd;
-+      v->pp = ppd;
-+      SLIST_INSERT_HEAD(&kp->vp, v, next);
-+    }
-+    else
-+    {
-+      vpd = 0;
-+      // find the pd vaddr
-+      SLIST_FOREACH(v, &kp->vp, next)
-+	if (v->pp == (*(u_int64_t *)(vpdpt + KVM_G2PDPTE(ga)) &
-+		      0xfffffffffffff000))
-+	{
-+	  vpd = v->vp;
-+	  break;
-+	}
-+    }
-+    if (!vpd)
-+      return (EFAULT);
 +
-+    // check if the pde exists
-+    if (!*(u_int64_t *)(vpd + KVM_G2PDE(ga)))
++    // check if we already have the vpd
++    if (pdpte != KVM_G2PDPTE(ga))
 +    {
-+      // create a new EPT-PT
-+      vpt = uvm_km_zalloc(kernel_map, PAGE_SIZE);
-+      pmap_extract(pmap_kernel(), vpt, &ppt);
-+      *(u_int64_t *)(vpd + KVM_G2PDE(ga)) = ppt | KVM_RWX;
-+      // add the entry to the page list
-+      v = malloc(sizeof(struct v_vmx_vpage), M_MEMDESC, M_WAITOK);
-+      v->vp = vpt;
-+      v->pp = ppt;
-+      SLIST_INSERT_HEAD(&kp->vp, v, next);
++      pdpte = KVM_G2PDPTE(ga);
++      pde = 0xffffffff;
++      // check if the pdpte exists
++      if (!*(u_int64_t *)(vpdpt + KVM_G2PDPTE(ga)))
++      {
++	// if we want to unmap, and the pdpte doesn't exist, just exit
++	if (unmap)
++	  return (0);
++	// create a new EPT-PD
++	vpd = uvm_km_zalloc(kernel_map, PAGE_SIZE);
++	pmap_extract(pmap_kernel(), vpd, &ppd);
++	*(u_int64_t *)(vpdpt + KVM_G2PDPTE(ga)) = ppd | KVM_RWX;
++	// add the entry to the page list
++	v = malloc(sizeof(struct v_kvm_vpage), M_MEMDESC, M_WAITOK);
++	v->vp = vpd;
++	v->pp = ppd;
++	SLIST_INSERT_HEAD(&kp->vp, v, next);
++      }
++      else
++      {
++	vpd = 0;
++	// find the pd vaddr
++	SLIST_FOREACH(v, &kp->vp, next)
++	  if (v->pp == (*(u_int64_t *)(vpdpt + KVM_G2PDPTE(ga)) &
++			0xfffffffffffff000))
++	  {
++	    vpd = v->vp;
++	    break;
++	  }
++      }
++      if (!vpd)
++	return (EFAULT);
 +    }
-+    else
++
++    // check if we already have te vpt
++    if (pde != KVM_G2PDE(ga))
 +    {
-+      vpt = 0;
-+      // find the pt vaddr
-+      SLIST_FOREACH(v, &kp->vp, next)
-+	if (v->pp == (*(u_int64_t *)(vpd + KVM_G2PDE(ga)) &
-+		      0xfffffffffffff000))
-+	{
-+	  vpt = v->vp;
-+	  break;
-+	}
++      pde = KVM_G2PDE(ga);
++      // check if the pde exists
++      if (!*(u_int64_t *)(vpd + KVM_G2PDE(ga)))
++      {
++	// if we want to unmap, and the pde doesn't exist, just exit
++	if (unmap)
++	  return (0);
++	// create a new EPT-PT
++	vpt = uvm_km_zalloc(kernel_map, PAGE_SIZE);
++	pmap_extract(pmap_kernel(), vpt, &ppt);
++	*(u_int64_t *)(vpd + KVM_G2PDE(ga)) = ppt | KVM_RWX;
++	// add the entry to the page list
++	v = malloc(sizeof(struct v_vmx_vpage), M_MEMDESC, M_WAITOK);
++	v->vp = vpt;
++	v->pp = ppt;
++	SLIST_INSERT_HEAD(&kp->vp, v, next);
++      }
++      else
++      {
++	vpt = 0;
++	// find the pt vaddr
++	SLIST_FOREACH(v, &kp->vp, next)
++	  if (v->pp == (*(u_int64_t *)(vpd + KVM_G2PDE(ga)) &
++			0xfffffffffffff000))
++	  {
++	    vpt = v->vp;
++	    break;
++	  }
++      }
++      if (!vpt)
++	return (EFAULT);
 +    }
-+    if (!vpt)
-+      return (EFAULT);
 +
 +    // map the page
 +    if (!unmap)
@@ -2251,26 +2208,91 @@
 +    return (-ENODEV);
 +  }
 +}
---- arch/amd64/amd64/svm.c	Thu Jan  1 01:00:00 1970
-+++ arch/amd64/amd64/svm.c	Sat Nov  5 20:53:48 2016
-@@ -0,0 +1,1141 @@
-+/*
-+ * Copyright (c) 2016 Mickael Torres
-+ * All rights reserved.
-+ *
-+ * Permission to use, copy, modify, and distribute this software for any
-+ * purpose with or without fee is hereby granted, provided that the above
-+ * copyright notice and this permission notice appear in all copies.
-+ *
-+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
-+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
-+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-+ */
+diff -Pru stable-tree/src/sys/arch/amd64/amd64/autoconf.c kvm-tree/src/sys/arch/amd64/amd64/autoconf.c
+--- stable-tree/src/sys/arch/amd64/amd64/autoconf.c	Sat Nov  5 11:17:44 2016
++++ kvm-tree/src/sys/arch/amd64/amd64/autoconf.c	Sat Nov  5 11:16:32 2016
+@@ -105,6 +105,9 @@
+ extern int	amd64_has_aesni;
+ #endif
+ 
++void		svm_setup(void);
++void		vmx_setup(void);
 +
+ /*
+  * Determine i/o configuration for a machine.
+  */
+@@ -154,6 +157,8 @@
+ 	if (amd64_has_aesni)
+ 		aesni_setup();
+ #endif
++	svm_setup();
++	vmx_setup();
+ }
+ 
+ void
+diff -Pru stable-tree/src/sys/arch/amd64/amd64/conf.c kvm-tree/src/sys/arch/amd64/amd64/conf.c
+--- stable-tree/src/sys/arch/amd64/amd64/conf.c	Sat Nov  5 11:17:44 2016
++++ kvm-tree/src/sys/arch/amd64/amd64/conf.c	Sat Nov  5 11:16:32 2016
+@@ -112,6 +112,12 @@
+ 	(dev_type_stop((*))) enodev, 0, seltrue, \
+ 	(dev_type_mmap((*))) enodev }
+ 
++/* open, close, ioctl, mmap */
++#define cdev_kvm_init(c,n) {						\
++    dev_init(c,n,open), dev_init(c,n,close),				\
++      (dev_type_read((*))) enodev, (dev_type_write((*))) enodev,	\
++      dev_init(c,n,ioctl), (dev_type_stop((*))) enodev, 0, seltrue, 	\
++      dev_init(c,n,mmap) }
+ 
+ #define	mmread	mmrw
+ #define	mmwrite	mmrw
+@@ -164,6 +170,8 @@
+ cdev_decl(drm);
+ #include "viocon.h"
+ cdev_decl(viocon);
++#include "kvm.h"
++cdev_decl(kvm);
+ 
+ #include "wsdisplay.h"
+ #include "wskbd.h"
+@@ -295,6 +303,7 @@
+ 	cdev_tty_init(NVIOCON,viocon),  /* 94: virtio console */
+ 	cdev_pvbus_init(NPVBUS,pvbus),	/* 95: pvbus(4) control interface */
+ 	cdev_ipmi_init(NIPMI,ipmi),	/* 96: ipmi */
++	cdev_kvm_init(NKVM,kvm),        /* 97: kvm */
+ };
+ int	nchrdev = nitems(cdevsw);
+ 
+diff -Pru stable-tree/src/sys/arch/amd64/amd64/cpu.c kvm-tree/src/sys/arch/amd64/amd64/cpu.c
+--- stable-tree/src/sys/arch/amd64/amd64/cpu.c	Sat Nov  5 11:17:44 2016
++++ kvm-tree/src/sys/arch/amd64/amd64/cpu.c	Sat Nov  5 11:16:32 2016
+@@ -659,6 +659,9 @@
+ 	}
+ }
+ 
++void svm_enter(void);
++void vmx_enter(void);
++
+ /*
+  * The CPU ends up here when it's ready to run
+  * This is called from code in mptramp.s; at this point, we are running
+@@ -736,6 +739,12 @@
+ 	nanouptime(&ci->ci_schedstate.spc_runtime);
+ 	splx(s);
+ 
++	// setup SVM for this AP
++	svm_enter();
++	
++	// setup VMX for this AP
++	vmx_enter();
++	
+ 	SCHED_LOCK(s);
+ 	cpu_switchto(NULL, sched_chooseproc());
+ }
+diff -Pru stable-tree/src/sys/arch/amd64/amd64/svm.c kvm-tree/src/sys/arch/amd64/amd64/svm.c
+--- stable-tree/src/sys/arch/amd64/amd64/svm.c	Thu Jan  1 01:00:00 1970
++++ kvm-tree/src/sys/arch/amd64/amd64/svm.c	Sat Nov  5 14:34:38 2016
+@@ -0,0 +1,1124 @@
 +#include <sys/types.h>
 +#include <sys/param.h>
 +#include <sys/systm.h>
@@ -3395,26 +3417,10 @@
 +  kvm_svm_ptr.run = (void *)svm_run;
 +  return (&kvm_svm_ptr);
 +}
---- arch/amd64/amd64/vmx.c	Thu Jan  1 01:00:00 1970
-+++ arch/amd64/amd64/vmx.c	Sat Nov  5 20:53:54 2016
-@@ -0,0 +1,1773 @@
-+/*
-+ * Copyright (c) 2016 Mickael Torres
-+ * All rights reserved.
-+ *
-+ * Permission to use, copy, modify, and distribute this software for any
-+ * purpose with or without fee is hereby granted, provided that the above
-+ * copyright notice and this permission notice appear in all copies.
-+ *
-+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
-+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
-+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-+ */
-+
+diff -Pru stable-tree/src/sys/arch/amd64/amd64/vmx.c kvm-tree/src/sys/arch/amd64/amd64/vmx.c
+--- stable-tree/src/sys/arch/amd64/amd64/vmx.c	Thu Jan  1 01:00:00 1970
++++ kvm-tree/src/sys/arch/amd64/amd64/vmx.c	Sat Nov  5 18:17:02 2016
+@@ -0,0 +1,1756 @@
 +#include <sys/types.h>
 +#include <sys/param.h>
 +#include <sys/systm.h>
@@ -5171,8 +5177,9 @@
 +  kvm_vmx_ptr.run = (void *)vmx_run;
 +  return (&kvm_vmx_ptr);
 +}
---- arch/amd64/conf/GENERIC	Sat Nov  5 11:17:44 2016
-+++ arch/amd64/conf/GENERIC	Sat Nov  5 19:48:42 2016
+diff -Pru stable-tree/src/sys/arch/amd64/conf/GENERIC kvm-tree/src/sys/arch/amd64/conf/GENERIC
+--- stable-tree/src/sys/arch/amd64/conf/GENERIC	Sat Nov  5 11:17:44 2016
++++ kvm-tree/src/sys/arch/amd64/conf/GENERIC	Sat Nov  5 19:48:42 2016
 @@ -637,6 +637,7 @@
  pseudo-device	pctr		1
  pseudo-device	nvram		1
@@ -5181,8 +5188,9 @@
  
  # mouse & keyboard multiplexor pseudo-devices
  pseudo-device	wsmux		2
---- arch/amd64/conf/files.amd64	Sat Nov  5 11:17:44 2016
-+++ arch/amd64/conf/files.amd64	Sat Nov  5 11:16:34 2016
+diff -Pru stable-tree/src/sys/arch/amd64/conf/files.amd64 kvm-tree/src/sys/arch/amd64/conf/files.amd64
+--- stable-tree/src/sys/arch/amd64/conf/files.amd64	Sat Nov  5 11:17:44 2016
++++ kvm-tree/src/sys/arch/amd64/conf/files.amd64	Sat Nov  5 11:16:34 2016
 @@ -13,6 +13,8 @@
  file	arch/amd64/amd64/via.c
  file	arch/amd64/amd64/aes_intel.S		crypto
@@ -5205,8 +5213,9 @@
  
  #
  # Machine-independent SD/MMC drivers
---- arch/amd64/include/cpu.h	Sat Nov  5 11:17:44 2016
-+++ arch/amd64/include/cpu.h	Sat Nov  5 11:16:34 2016
+diff -Pru stable-tree/src/sys/arch/amd64/include/cpu.h kvm-tree/src/sys/arch/amd64/include/cpu.h
+--- stable-tree/src/sys/arch/amd64/include/cpu.h	Sat Nov  5 11:17:44 2016
++++ kvm-tree/src/sys/arch/amd64/include/cpu.h	Sat Nov  5 11:16:34 2016
 @@ -183,6 +183,9 @@
  	union		vmm_cpu_cap ci_vmm_cap;
  	paddr_t		ci_vmxon_region_pa;
@@ -5217,8 +5226,9 @@
  };
  
  #define CPUF_BSP	0x0001		/* CPU is the original BSP */
---- arch/amd64/include/kvm.h	Thu Jan  1 01:00:00 1970
-+++ arch/amd64/include/kvm.h	Sat Nov  5 13:40:10 2016
+diff -Pru stable-tree/src/sys/arch/amd64/include/kvm.h kvm-tree/src/sys/arch/amd64/include/kvm.h
+--- stable-tree/src/sys/arch/amd64/include/kvm.h	Thu Jan  1 01:00:00 1970
++++ kvm-tree/src/sys/arch/amd64/include/kvm.h	Sat Nov  5 13:40:10 2016
 @@ -0,0 +1,1031 @@
 +#ifndef _MACHINE_KVM_H_
 +#define _MACHINE_KVM_H_
@@ -5833,7 +5843,7 @@
 +    char padding[2048];
 +  } s;
 +};
-+#ifdef _KERNEL
++
 +struct kvm_vcpu
 +{
 +  int created;
@@ -5876,7 +5886,7 @@
 +  paddr_t identity_base;
 +  paddr_t tss_base;
 +};
-+#endif // _KERNEL
++
 +//
 +// not implemented
 +//
@@ -6251,8 +6261,9 @@
 +};
 +
 +#endif /* !_MACHINE_KVM_H_ */
---- arch/amd64/include/svm.h	Thu Jan  1 01:00:00 1970
-+++ arch/amd64/include/svm.h	Sat Nov  5 12:47:19 2016
+diff -Pru stable-tree/src/sys/arch/amd64/include/svm.h kvm-tree/src/sys/arch/amd64/include/svm.h
+--- stable-tree/src/sys/arch/amd64/include/svm.h	Thu Jan  1 01:00:00 1970
++++ kvm-tree/src/sys/arch/amd64/include/svm.h	Sat Nov  5 12:47:19 2016
 @@ -0,0 +1,261 @@
 +#ifndef _MACHINE_SVM_H_
 +#define _MACHINE_SVM_H_
@@ -6515,8 +6526,9 @@
 +  }
 +
 +#endif /* !_MACHINE_SVM_H_ */
---- arch/amd64/include/vmx.h	Thu Jan  1 01:00:00 1970
-+++ arch/amd64/include/vmx.h	Sat Nov  5 20:54:10 2016
+diff -Pru stable-tree/src/sys/arch/amd64/include/vmx.h kvm-tree/src/sys/arch/amd64/include/vmx.h
+--- stable-tree/src/sys/arch/amd64/include/vmx.h	Thu Jan  1 01:00:00 1970
++++ kvm-tree/src/sys/arch/amd64/include/vmx.h	Sat Nov  5 12:47:09 2016
 @@ -0,0 +1,292 @@
 +#ifndef _MACHINE_VMX_H_
 +#define _MACHINE_VMX_H_
@@ -6810,8 +6822,9 @@
 +struct kvm_hw_ptr *vmx_get_hw(void);
 +
 +#endif /* !_MACHINE_VMX_H_ */
---- sys/proc.h	Sat Nov  5 11:17:47 2016
-+++ sys/sys/proc.h	Sat Nov  5 11:16:37 2016
+diff -Pru stable-tree/src/sys/sys/proc.h kvm-tree/src/sys/sys/proc.h
+--- stable-tree/src/sys/sys/proc.h	Sat Nov  5 11:17:47 2016
++++ kvm-tree/src/sys/sys/proc.h	Sat Nov  5 11:16:37 2016
 @@ -270,7 +270,11 @@
       "\017NOZOMBIE" "\020STOPPED" "\021SYSTEM" "\022EMBRYO" "\023ZOMBIE" \
       "\024NOBROADCASTKILL" "\025PLEDGE")
