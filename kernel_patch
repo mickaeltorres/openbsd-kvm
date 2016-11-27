@@ -1,7 +1,93 @@
-diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64/amd64/kvm.c
---- stable-tree/src/sys/arch/amd64/amd64/kvm.c  Thu Jan  1 01:00:00 1970
-+++ kvm-tree/src/sys/arch/amd64/amd64/kvm.c	Wed Nov 16 11:41:18 2016
-@@ -0,0 +1,2206 @@
+diff --git a/sys/arch/amd64/amd64/autoconf.c b/sys/arch/amd64/amd64/autoconf.c
+index c75907a..85ef356 100644
+--- a/sys/arch/amd64/amd64/autoconf.c
++++ b/sys/arch/amd64/amd64/autoconf.c
+@@ -105,6 +105,9 @@ void		aesni_setup(void);
+ extern int	amd64_has_aesni;
+ #endif
+ 
++void		svm_setup(void);
++void		vmx_setup(void);
++
+ /*
+  * Determine i/o configuration for a machine.
+  */
+@@ -154,6 +157,8 @@ cpu_configure(void)
+ 	if (amd64_has_aesni)
+ 		aesni_setup();
+ #endif
++	svm_setup();
++	vmx_setup();
+ }
+ 
+ void
+diff --git a/sys/arch/amd64/amd64/conf.c b/sys/arch/amd64/amd64/conf.c
+index 1009144..b96780b 100644
+--- a/sys/arch/amd64/amd64/conf.c
++++ b/sys/arch/amd64/amd64/conf.c
+@@ -112,6 +112,12 @@ int	nblkdev = nitems(bdevsw);
+ 	(dev_type_stop((*))) enodev, 0, seltrue, \
+ 	(dev_type_mmap((*))) enodev }
+ 
++/* open, close, ioctl, mmap */
++#define cdev_kvm_init(c,n) {						\
++    dev_init(c,n,open), dev_init(c,n,close),				\
++      (dev_type_read((*))) enodev, (dev_type_write((*))) enodev,	\
++      dev_init(c,n,ioctl), (dev_type_stop((*))) enodev, 0, seltrue, 	\
++      dev_init(c,n,mmap) }
+ 
+ #define	mmread	mmrw
+ #define	mmwrite	mmrw
+@@ -164,6 +170,8 @@ cdev_decl(nvram);
+ cdev_decl(drm);
+ #include "viocon.h"
+ cdev_decl(viocon);
++#include "kvm.h"
++cdev_decl(kvm);
+ 
+ #include "wsdisplay.h"
+ #include "wskbd.h"
+@@ -295,6 +303,7 @@ struct cdevsw	cdevsw[] =
+ 	cdev_tty_init(NVIOCON,viocon),  /* 94: virtio console */
+ 	cdev_pvbus_init(NPVBUS,pvbus),	/* 95: pvbus(4) control interface */
+ 	cdev_ipmi_init(NIPMI,ipmi),	/* 96: ipmi */
++	cdev_kvm_init(NKVM,kvm),        /* 97: kvm */
+ };
+ int	nchrdev = nitems(cdevsw);
+ 
+diff --git a/sys/arch/amd64/amd64/cpu.c b/sys/arch/amd64/amd64/cpu.c
+index c1dedf9..f9bccc0 100644
+--- a/sys/arch/amd64/amd64/cpu.c
++++ b/sys/arch/amd64/amd64/cpu.c
+@@ -659,6 +659,9 @@ cpu_boot_secondary(struct cpu_info *ci)
+ 	}
+ }
+ 
++void svm_enter(void);
++void vmx_enter(void);
++
+ /*
+  * The CPU ends up here when it's ready to run
+  * This is called from code in mptramp.s; at this point, we are running
+@@ -736,6 +739,12 @@ cpu_hatch(void *v)
+ 	nanouptime(&ci->ci_schedstate.spc_runtime);
+ 	splx(s);
+ 
++	// setup SVM for this AP
++	svm_enter();
++	
++	// setup VMX for this AP
++	vmx_enter();
++	
+ 	SCHED_LOCK(s);
+ 	cpu_switchto(NULL, sched_chooseproc());
+ }
+diff --git a/sys/arch/amd64/amd64/kvm.c b/sys/arch/amd64/amd64/kvm.c
+new file mode 100644
+index 0000000..c7c2d92
+--- /dev/null
++++ b/sys/arch/amd64/amd64/kvm.c
+@@ -0,0 +1,2510 @@
 +/*
 + * Copyright (c) 2016 Mickael Torres
 + * All rights reserved.
@@ -635,7 +721,6 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +{
 +  int i;
 +
-+  addr &= 0xfffffffffffff000;
 +  // find addr in mappings
 +  for (i = 0; i < 32; i++)
 +    if (kp->mem[i].used)
@@ -646,10 +731,12 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +	addr /= PAGE_SIZE;
 +	if ((addr / 64) >= (kp->mem[i].dirty_size / 8))
 +	  return (-1);
-+	kp->mem[i].dirty[addr / 64] |= (1 << (addr % 64));
++	kp->mem[i].dirty[addr / 64] |= ((u_int64_t)1 << (addr % 64));
 +	break;
 +      }
 +
++  if (i == 32)
++    return (-1);
 +  return (0);
 +}
 +
@@ -661,16 +748,17 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +  // check slot nr
 +  if (slot > 31)
 +    return;
++
 +  // clean
 +  for (i = 0; i < (kp->mem[slot].dirty_size / 8); i++)
-+  {
 +    if (kp->mem[slot].dirty[i])
++    {
 +      for (j = 0; j < 64; j++)
-+	if (kp->mem[slot].dirty[i] & (1 << j))
++	if (kp->mem[slot].dirty[i] & ((u_int64_t)1 << j))
 +	  kvm_set_prot(kp, kp->mem[slot].gpaddr +
 +		       (((i * 64) + j) * PAGE_SIZE), KVM_RX);
-+    kp->mem[slot].dirty[i] = 0;
-+  }
++      kp->mem[slot].dirty[i] = 0;
++    }
 +}
 +
 +int kvm_set_user_memory_region(struct proc *p, struct kvm_p *kp,
@@ -737,7 +825,9 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +  if (m->flags & KVM_MEM_LOG_DIRTY_PAGES)
 +  {
 +    // allocate bitmap
-+    kp->mem[m->slot].dirty_size = ((m->memory_size / PAGE_SIZE) + 7) / 8;
++    // size is on bytes, multiple of 8 as bitmap is u_int64_t *
++    kp->mem[m->slot].dirty_size =
++      (((m->memory_size / PAGE_SIZE) + 7) / 8) * 8;
 +    kp->mem[m->slot].dirty = malloc(kp->mem[m->slot].dirty_size,
 +				    M_MEMDESC, M_WAITOK);
 +    if (!kp->mem[m->slot].dirty)
@@ -763,14 +853,22 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +
 +int kvm_get_dirty_log(struct kvm_p *kp, struct kvm_dirty_log *l)
 +{
++  size_t size;
 +  int err;
 +  
 +  // verify slot nr
 +  if (l->slot > 31)
 +    return (-EFAULT);
 +
++  // verify slot has a bitmap
++  if (!kp->mem[l->slot].dirty)
++    return (-1);
++
++  // size to copy
++  size = ((kp->mem[l->slot].size / PAGE_SIZE) + 7) / 8;
++
 +  // copy to user and clean
-+  err = copyout(kp->mem[l->slot].dirty, l->dirty_bitmap, kp->mem[l->slot].dirty_size);
++  err = copyout(kp->mem[l->slot].dirty, l->dirty_bitmap, size);
 +  if (!err)
 +    kvm_clean_dirty_bmap(kp, l->slot);
 +  
@@ -779,15 +877,13 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +
 +u_int64_t kvm_guest_translate(struct kvm_p *kp, struct kvm_run *run,
 +			      u_int64_t cr0, u_int64_t cr3, u_int64_t efer,
-+			      u_int64_t v)
++			      u_int64_t v, u_int64_t *ret)
 +{
 +  int i;
 +
 +  // if paging is enabled, we have to go through guest pml4/pde
 +  if (cr0 & (1 << 31))
-+  {
-+    cr3 &= 0xfffffffffffff000;
-+    
++  {    
 +    if (!(efer & (1 << 8)))
 +    {
 +      // protected mode paging
@@ -796,6 +892,8 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      run->hw.hardware_exit_reason = 0x2000;
 +      return (1);
 +    }
++
++    cr3 &= 0xfffffffffffff000;
 +    
 +    // long mode paging
 +    // search mappings for pml4
@@ -916,14 +1014,118 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      }
 +    }
 +  }
-+  return (v);
++  *ret = v;
++  return (0);
 +}
 +
-+int kvm_emul_modrm(void *hw, struct kvm_p *kp, struct kvm_run *run,
++int kvm_emul_modrm16(struct kvm_p *kp, u_int8_t *modrm, u_int32_t op_size)
++{
++  // set register
++  switch (*modrm)
++  {
++  case 0x00 ... 0x07:
++  case 0x40 ... 0x47:
++  case 0x80 ... 0x87:
++  case 0xc0 ... 0xc7:
++    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
++    break;
++
++  case 0x08 ... 0x0f:
++  case 0x48 ... 0x4f:
++  case 0x88 ... 0x8f:
++  case 0xc8 ... 0xcf:
++    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RCX);
++    break;
++
++  case 0x10 ... 0x17:
++  case 0x50 ... 0x57:
++  case 0x90 ... 0x97:
++  case 0xd0 ... 0xd7:
++    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDX);
++    break;
++
++  case 0x18 ... 0x1f:
++  case 0x58 ... 0x5f:
++  case 0x98 ... 0x9f:
++  case 0xd8 ... 0xdf:
++    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBX);
++    break;
++
++  case 0x20 ... 0x27:
++  case 0x60 ... 0x67:
++  case 0xa0 ... 0xa7:
++  case 0xe0 ... 0xe7:
++    if (op_size == 1)
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
++    else
++    {
++      printf("KVM: unandled register RSP in modrm16\n");
++      kp->vcpu.kr->exit_reason = KVM_EXIT_UNKNOWN;
++      kp->vcpu.kr->hw.hardware_exit_reason = -1;
++      return (1);
++    }
++    break;
++
++  case 0x28 ... 0x2f:
++  case 0x68 ... 0x6f:
++  case 0xa8 ... 0xaf:
++  case 0xe8 ... 0xef:
++    if (op_size == 1)
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RCX);
++    else
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBP);
++    break;
++
++  case 0x30 ... 0x37:
++  case 0x70 ... 0x77:
++  case 0xb0 ... 0xb7:
++  case 0xf0 ... 0xf7:
++    if (op_size == 1)
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDX);
++    else
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RSI);
++    break;
++
++  case 0x38 ... 0x3f:
++  case 0x78 ... 0x7f:
++  case 0xb8 ... 0xbf:
++  case 0xf8 ... 0xff:
++    if (op_size == 1)
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBX);
++    else
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDI);
++    break;
++  }
++  // set instruction size
++  if (*modrm < 0x40)
++  {
++    if ((*modrm % 8) == 6)
++      kp->vcpu.insn_len += 2;
++    return (0);
++  }
++  if (*modrm < 0x80)
++  {
++    kp->vcpu.insn_len += 1;
++    return (0);
++  }
++  if (*modrm < 0xc0)
++  {
++    kp->vcpu.insn_len += 2;
++    return (0);
++  }
++
++  return (0);
++}
++
++int kvm_emul_modrm(struct kvm_p *kp, struct kvm_run *run,
 +		   u_int8_t *modrm,
 +		   u_int32_t prfx, u_int64_t rip, u_int32_t addr_size,
-+		   u_int32_t op_size)
++		   u_int32_t op_size, u_int64_t cr0)
 +{
++  //  if protection not enabled, use 16 bits modrm
++  if (!(cr0 & 1))
++    return (kvm_emul_modrm16(kp, modrm, op_size));
++  
 +  switch (*modrm) // MODRM
 +  {
 +    // RAX / R8
@@ -936,9 +1138,9 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +  case 0x00 ... 0x03:
 +  case 0x06 ... 0x07:
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R8);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R8);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RAX);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
 +    break;
 +  case 0x04:
 +    if ((modrm[1] & 0b111) == 5)
@@ -946,9 +1148,9 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    else
 +      kp->vcpu.insn_len++;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R8);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R8);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RAX);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
 +    break;
 +  case 0x44:
 +    if ((modrm[1] & 0b111) == 5)
@@ -956,9 +1158,9 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    else
 +      kp->vcpu.insn_len += 2;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R8);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R8);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RAX);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
 +    break;
 +    
 +    // RCX / R9
@@ -971,9 +1173,9 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +  case 0x08 ... 0x0b:
 +  case 0x0e ... 0x0f:
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R9);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R9);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RCX);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RCX);
 +    break;
 +  case 0x0c:
 +    if ((modrm[1] & 0b111) == 5)
@@ -981,9 +1183,9 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    else
 +      kp->vcpu.insn_len++;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R9);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R9);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RCX);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RCX);
 +    break;
 +  case 0x4c:
 +    if ((modrm[1] & 0b111) == 5)
@@ -991,9 +1193,9 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    else
 +      kp->vcpu.insn_len += 2;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R9);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R9);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RCX);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RCX);
 +    break;
 +
 +    // RDX / R10
@@ -1006,9 +1208,9 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +  case 0x10 ... 0x13:
 +  case 0x16 ... 0x17:
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R10);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R10);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RDX);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDX);
 +    break;
 +  case 0x14:
 +    if ((modrm[1] & 0b111) == 5)
@@ -1016,9 +1218,9 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    else
 +      kp->vcpu.insn_len++;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R10);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R10);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RDX);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDX);
 +    break;
 +  case 0x54:
 +    if ((modrm[1] & 0b111) == 5)
@@ -1026,9 +1228,9 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    else
 +      kp->vcpu.insn_len += 2;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R10);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R10);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RDX);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDX);
 +    break;
 +    
 +    // RBX / R11
@@ -1041,9 +1243,9 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +  case 0x18 ... 0x1b:
 +  case 0x1e ... 0x1f:
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R11);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R11);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RBX);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBX);
 +    break;
 +  case 0x1c:
 +    if ((modrm[1] & 0b111) == 5)
@@ -1051,9 +1253,9 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    else
 +      kp->vcpu.insn_len++;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R11);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R11);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RBX); 
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBX); 
 +    break;
 +  case 0x5c:
 +    if ((modrm[1] & 0b111) == 5)
@@ -1061,9 +1263,9 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    else
 +      kp->vcpu.insn_len += 2;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R11);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R11);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RBX); 
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBX); 
 +    break;
 +
 +    // RSP / R12
@@ -1076,17 +1278,26 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +  case 0x20 ... 0x23:
 +  case 0x26 ... 0x27:
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R12);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R12);
 +    else
 +    {
 +      if (op_size != 1)
 +      {
-+	printf("VMX: unandled register RSP in modrm\n");
++	printf("KVM: unandled register RSP in modrm\n");
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
 +	run->hw.hardware_exit_reason = -1;
 +	return (1);
 +      }
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RAX) + 1;
++      if ((prfx & PRFX_REX) || (prfx & PRFX_REXW) ||
++	  (prfx & PRFX_REXX) || (prfx & PRFX_REXB))
++      {
++	printf("KVM: unandled register RSP in modrm\n");
++	run->exit_reason = KVM_EXIT_UNKNOWN;
++	run->hw.hardware_exit_reason = -1;
++	return (1);
++      }
++      else
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX) + 1;
 +    }
 +    break;
 +  case 0x24:
@@ -1094,30 +1305,46 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      kp->vcpu.insn_len += 5;
 +    else
 +      kp->vcpu.insn_len++;
-+    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R12);
-+    else
++    if (op_size != 1)
 +    {
-+      printf("VMX: unandled register RSP in modrm\n");
++      printf("KVM: unandled register RSP in modrm\n");
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
 +      run->hw.hardware_exit_reason = -1;
 +      return (1);
 +    }
++    if ((prfx & PRFX_REX) || (prfx & PRFX_REXW) ||
++	(prfx & PRFX_REXX) || (prfx & PRFX_REXB))
++    {
++      printf("KVM: unandled register RSP in modrm\n");
++      run->exit_reason = KVM_EXIT_UNKNOWN;
++      run->hw.hardware_exit_reason = -1;
++      return (1);
++    }
++    else
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX) + 1;
 +    break;
 +  case 0x64:
 +    if ((modrm[1] & 0b111) == 5)
 +      kp->vcpu.insn_len += 3;
 +    else
 +      kp->vcpu.insn_len += 2;
-+    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R12);
-+    else
++    if (op_size != 1)
 +    {
-+      printf("VMX: unandled register RSP in modrm\n");
++      printf("KVM: unandled register RSP in modrm\n");
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
 +      run->hw.hardware_exit_reason = -1;
 +      return (1);
 +    }
++    if ((prfx & PRFX_REX) || (prfx & PRFX_REXW) ||
++	(prfx & PRFX_REXX) || (prfx & PRFX_REXB))
++    {
++      printf("KVM: unandled register RSP in modrm\n");
++      run->exit_reason = KVM_EXIT_UNKNOWN;
++      run->hw.hardware_exit_reason = -1;
++      return (1);
++    }
++    else
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX) + 1;
 +    break;
 +
 +    // RBP / R13
@@ -1130,9 +1357,14 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +  case 0x28 ... 0x2b:
 +  case 0x2e ... 0x2f:
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R13);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R13);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RBP);
++      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
++	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
++	  (op_size == 1))
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RCX) + 1;
++      else
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBP);
 +    break;
 +  case 0x2c:
 +    if ((modrm[1] & 0b111) == 5)
@@ -1140,9 +1372,14 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    else
 +      kp->vcpu.insn_len++;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R13);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R13);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RBP);
++      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
++	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
++	  (op_size == 1))
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RCX) + 1;
++      else
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBP);
 +    break;
 +  case 0x6c:
 +    if ((modrm[1] & 0b111) == 5)
@@ -1150,9 +1387,14 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    else
 +      kp->vcpu.insn_len += 2;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R13);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R13);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RBP);
++      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
++	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
++	  (op_size == 1))
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RCX) + 1;
++      else
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBP);
 +    break;
 +    
 +    // RSI / R14
@@ -1165,9 +1407,14 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +  case 0x30 ... 0x33:
 +  case 0x36 ... 0x37:
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R14);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R14);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RSI);
++      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
++	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
++	  (op_size == 1))
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDX) + 1;
++      else
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RSI);
 +    break;
 +  case 0x34:
 +    if ((modrm[1] & 0b111) == 5)
@@ -1175,9 +1422,14 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    else
 +      kp->vcpu.insn_len++;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R14);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R14);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RSI);
++      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
++	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
++	  (op_size == 1))
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDX) + 1;
++      else
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RSI);
 +    break;
 +  case 0x74:
 +    if ((modrm[1] & 0b111) == 5)
@@ -1185,9 +1437,14 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    else
 +      kp->vcpu.insn_len += 2;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R14);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R14);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RSI);
++      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
++	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
++	  (op_size == 1))
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDX) + 1;
++      else
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RSI);
 +    break;
 +
 +    // RDI / R15
@@ -1200,9 +1457,14 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +  case 0x38 ... 0x3b:
 +  case 0x3e ... 0x3f:
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R15);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R15);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RDI);
++      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
++	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
++	  (op_size == 1))
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBX) + 1;
++      else
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDI);
 +    break;
 +  case 0x3c:
 +    if ((modrm[1] & 0b111) == 5)
@@ -1210,9 +1472,14 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    else
 +      kp->vcpu.insn_len++;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R15);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R15);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RDI);
++      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
++	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
++	  (op_size == 1))
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBX) + 1;
++      else
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDI);
 +    break;
 +  case 0x7c:
 +    if ((modrm[1] & 0b111) == 5)
@@ -1220,9 +1487,14 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    else
 +      kp->vcpu.insn_len += 2;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_R15);
++      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R15);
 +    else
-+      kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RDI);
++      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
++	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
++	  (op_size == 1))
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBX) + 1;
++      else
++	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDI);
 +    break;
 +    
 +  default: // modrm not handled
@@ -1236,7 +1508,7 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +  return (0);
 +}
 +
-+void kvm_handle_mmio(void *hw, struct kvm_run *run, struct kvm_p *kp)
++void kvm_handle_mmio(struct kvm_run *run, struct kvm_p *kp)
 +{
 +  struct kvm_sregs s;
 +  struct kvm_regs r;
@@ -1245,6 +1517,7 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +  u_int32_t prfx;
 +  u_int64_t rip;
 +  u_int8_t *insn;
++  u_int8_t insn_buf[16];
 +  u_int64_t val;
 +  int i;
 +
@@ -1273,17 +1546,28 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    }
 +    // return to userland for RO memory write
 +  }
-+  
++
++  // TODO: use provided insn buffer on SVM
 +  // instruction is at CS:RIP
 +  rip = s.cs.base + r.rip;
 +
++  val = 0;
 +  // check if we need to translate guest paging
 +  if (s.cr0 & (1 << 31))
 +  {
-+    if ((rip = kvm_guest_translate(kp, run, s.cr0, s.cr3, s.efer, rip)) == 1)
++    if (kvm_guest_translate(kp, run, s.cr0, s.cr3, s.efer, rip, &rip))
 +      return;
-+    //    if ((rip % PAGE_SIZE) != ((rip + 15) % PAGE_SIZE))
-+    //printf("KVM: insn potentially at page boundary, unhandled case\n");
++    // check if insn is potentially at page boundary
++    // TODO: check guest page size
++    // TODO: maybe make a getter for insn bytes that can check for page bound
++    // do not enable for now
++# if 0
++    if ((rip / PAGE_SIZE) != ((rip + 15) / PAGE_SIZE))
++    {
++      if (kvm_guest_translate(kp, run, s.cr0, s.cr3, s.efer, rip + 15, &val))
++	return;
++    }
++#endif
 +  }
 +
 +  // search mappings
@@ -1302,8 +1586,42 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    return;
 +  }
 +
-+  // our instruction pointer
-+  insn = (void *)(kp->mem[i].vaddr + (rip - kp->mem[i].gpaddr));
++  // search mappings for rip + 15
++  if (val)
++  {
++    // save first mappings
++    prfx = i;
++    
++    // search mappings
++    for (i = 0; i < 32; i++)
++      if (kp->mem[i].used)
++	if ((val >= kp->mem[i].gpaddr) &&
++	    (val <= (kp->mem[i].gpaddr + kp->mem[i].size)))
++	  break;
++
++    // not found
++    if (i == 32)
++    {
++      printf("KVM: can't find RIP + 15 in memory mappings\n");
++      run->exit_reason = KVM_EXIT_UNKNOWN;
++      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++      return;
++    }
++
++    // copy to local buffer
++    memcpy(insn_buf,
++	   (void *)(kp->mem[prfx].vaddr + (rip - kp->mem[prfx].gpaddr)),
++	   15 - ((rip + 15) % PAGE_SIZE));
++    memcpy(insn_buf + 15 - ((rip + 15) % PAGE_SIZE),
++	   (void *)(kp->mem[i].vaddr + (val - kp->mem[i].gpaddr)),
++	   ((rip + 15) % PAGE_SIZE));
++    insn = insn_buf;
++  }
++  else
++  {
++    // our instruction pointer
++    insn = (void *)(kp->mem[i].vaddr + (rip - kp->mem[i].gpaddr));
++  }
 +
 +  // direction
 +  kp->vcpu.mmio.dir = (kp->vcpu.mmio.acc >> 1) & 1;
@@ -1337,6 +1655,12 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      insn++;
 +      continue;
 +    }
++    if (*insn == 0x40) // REX
++    {
++      prfx |= PRFX_REX;
++      insn++;
++      continue;
++    }
 +    if (*insn == 0x41) // REX.B
 +    {
 +      prfx |= PRFX_REXB;
@@ -1367,6 +1691,12 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      insn++;
 +      continue;
 +    }
++    if (*insn == 0x46) // REX.RX
++    {
++      prfx |= PRFX_REXR | PRFX_REXX;
++      insn++;
++      continue;
++    }
 +    if (*insn == 0x47) // REX.RXB
 +    {
 +      prfx |= PRFX_REXR | PRFX_REXX | PRFX_REXB;
@@ -1385,6 +1715,18 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      insn++;
 +      continue;
 +    }
++    if (*insn == 0x4a) // REX.WX
++    {
++      prfx |= PRFX_REXW | PRFX_REXX;
++      insn++;
++      continue;
++    }
++    if (*insn == 0x4b) // REX.WXB
++    {
++      prfx |= PRFX_REXW | PRFX_REXX | PRFX_REXB;
++      insn++;
++      continue;
++    }
 +    if (*insn == 0x4c) // REX.WR
 +    {
 +      prfx |= PRFX_REXW | PRFX_REXR;
@@ -1394,6 +1736,18 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    if (*insn == 0x4d) // REX.WRB
 +    {
 +      prfx |= PRFX_REXW | PRFX_REXR | PRFX_REXB;
++      insn++;
++      continue;
++    }
++    if (*insn == 0x4e) // REX.WRX
++    {
++      prfx |= PRFX_REXW | PRFX_REXR | PRFX_REXX;
++      insn++;
++      continue;
++    }
++    if (*insn == 0x4f) // REX.WRXB
++    {
++      prfx |= PRFX_REXW | PRFX_REXR | PRFX_REXX | PRFX_REXB;
 +      insn++;
 +      continue;
 +    }
@@ -1438,8 +1792,8 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    }
 +    kp->vcpu.insn_len = 2;
 +    kp->vcpu.mmio.flag = 16;
-+    op_size = 1;
-+    if (kvm_emul_modrm(hw, kp, run, insn + 1, prfx, rip, addr_size, op_size))
++    op_size = kp->vcpu.mmio.size = 1;
++    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, addr_size, op_size,s.cr0))
 +      return;
 +    break;
 +    
@@ -1447,6 +1801,7 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    switch (insn[1])
 +    {
 +    case 0xb6: // MOVZX R32, [R/M8]
++      op_size = kp->vcpu.mmio.size = 1;
 +    case 0xb7: // MOVZX R32, [R/M16]
 +      if (kp->vcpu.mmio.dir)
 +      {
@@ -1457,7 +1812,7 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +	return;
 +      }
 +      kp->vcpu.insn_len = 3;
-+      if (kvm_emul_modrm(hw, kp, run, insn + 2, prfx, rip, addr_size, op_size))
++      if (kvm_emul_modrm(kp, run, insn + 2, prfx, rip,addr_size,op_size,s.cr0))
 +	return;
 +      if (prfx & PRFX_REXW)
 +	*(u_int64_t *)(kp->vcpu.mmio.ptr) = 0;
@@ -1485,7 +1840,7 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    }
 +    kp->vcpu.insn_len = 2;
 +    kp->vcpu.mmio.flag = 4;
-+    if (kvm_emul_modrm(hw, kp, run, insn + 1, prfx, rip, addr_size, op_size))
++    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, addr_size, op_size,s.cr0))
 +      return;
 +    break;
 +
@@ -1523,9 +1878,9 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
 +      return;
 +    }
-+    kp->vcpu.mmio.size = 1;
 +    kp->vcpu.insn_len = 2;
-+    if (kvm_emul_modrm(hw, kp, run, insn + 1, prfx, rip, addr_size, op_size))
++    op_size = kp->vcpu.mmio.size = 1;
++    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, addr_size, op_size,s.cr0))
 +      return;
 +    break;
 +
@@ -1539,7 +1894,22 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      return;
 +    }
 +    kp->vcpu.insn_len = 2;
-+    if (kvm_emul_modrm(hw, kp, run, insn + 1, prfx, rip, addr_size, op_size))
++    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, addr_size, op_size,s.cr0))
++      return;
++    break;
++
++  case 0x8a: // MOV R8, [R/M8]
++    if (kp->vcpu.mmio.dir)
++    {
++      printf("KVM: opcode @%llx [%02x] is a read, exit is a write\n",
++	     rip, *insn);
++      run->exit_reason = KVM_EXIT_UNKNOWN;
++      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++      return;
++    }
++    kp->vcpu.insn_len = 2;
++    op_size = kp->vcpu.mmio.size = 1;
++    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, addr_size, op_size,s.cr0))
 +      return;
 +    break;
 +    
@@ -1553,7 +1923,7 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      return;
 +    }
 +    kp->vcpu.insn_len = 2;
-+    if (kvm_emul_modrm(hw, kp, run, insn + 1, prfx, rip, addr_size, op_size))
++    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, addr_size, op_size,s.cr0))
 +      return;
 +    break;
 +
@@ -1566,8 +1936,8 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
 +      return;
 +    }
-+    kp->vcpu.mmio.size = 4;
-+    kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RAX);
++    //    kp->vcpu.mmio.size = 4;
++    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
 +    kp->vcpu.insn_len = kp->vcpu.mmio.size + 1;
 +    break;
 +    
@@ -1580,7 +1950,7 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
 +      return;
 +    }
-+    kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RAX);
++    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
 +    kp->vcpu.insn_len = addr_size + 1;
 +    break;
 +    
@@ -1618,8 +1988,8 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    }
 +    if (*insn == 0xa4)
 +      kp->vcpu.mmio.size = 1;
-+    else
-+      kp->vcpu.mmio.size = 4;
++    //    else
++    //      kp->vcpu.mmio.size = 4;
 +    // increment or decrement esi edi
 +    if (r.rflags & (1 << 10))
 +    {
@@ -1631,7 +2001,7 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      r.rsi += kp->vcpu.mmio.size;
 +      r.rdi += kp->vcpu.mmio.size;
 +    }
-+    kvm_hw->set_regs(hw, &r);
++    kvm_hw->set_regs(kp->hw_data, &r);
 +    kp->vcpu.insn_len = 1;
 +    break;
 +
@@ -1644,18 +2014,18 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
 +      return;
 +    }
-+    kp->vcpu.mmio.ptr = (void *)kvm_hw->get_reg_ptr(hw, KVM_REG_RAX);
++    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
 +    // increment or decrement RDI
 +    if (r.rflags & (1 << 10))
 +      r.rdi -= kp->vcpu.mmio.size;
 +    else
 +      r.rdi += kp->vcpu.mmio.size;
-+    kvm_hw->set_regs(hw, &r);
++    kvm_hw->set_regs(kp->hw_data, &r);
 +    kp->vcpu.insn_len = 1;
 +    break;
 +
 +  case 0xc6: // MOV [OFF16/32], IMM8
-+    kp->vcpu.mmio.size = 1;
++    op_size = kp->vcpu.mmio.size = 1;
 +  case 0xc7: // MOV [OFF16/32], IMM16/32
 +    if (!kp->vcpu.mmio.dir)
 +    {
@@ -1666,7 +2036,7 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      return;
 +    }
 +    kp->vcpu.insn_len = 2 + kp->vcpu.mmio.size;
-+    if (kvm_emul_modrm(hw, kp, run, insn + 1, prfx, rip, addr_size, op_size))
++    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, addr_size, op_size,s.cr0))
 +      return;
 +    kp->vcpu.mmio.ptr = (void *)(insn + kp->vcpu.insn_len -
 +				 kp->vcpu.mmio.size);
@@ -1690,7 +2060,7 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    kp->vcpu.insn_len++;
 +
 +  if ((prfx & PRFX_REXR) || (prfx & PRFX_REXB) || (prfx & PRFX_REXW) ||
-+      (prfx & PRFX_REXX))
++      (prfx & PRFX_REXX) || (prfx & PRFX_REX))
 +    kp->vcpu.insn_len++;
 +
 +  if (prfx & PRFX_REP)
@@ -1711,7 +2081,7 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +	kp->vcpu.insn_len = 0;
 +      break;
 +    }
-+    kvm_hw->set_regs(hw, &r);
++    kvm_hw->set_regs(kp->hw_data, &r);
 +  }
 +
 +  kp->vcpu.mmio.flag |= 1;
@@ -1743,48 +2113,8 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +  return;
 +}
 +
-+int kvm_handle_pre_io(struct kvm_run *run, struct kvm_p *kp)
-+{
-+  int i;
-+
-+  kp->vcpu.io.flag = 0;
-+  if (kp->vcpu.io.dir == KVM_EXIT_IO_IN)
-+  {
-+    if (run->exit_reason != KVM_EXIT_IO)
-+    {
-+      printf("KVM: ERR userland did not fulfill IO access\n");
-+      return (-ENXIO);
-+    }
-+    for (i = 0; i < kp->vcpu.io.count; i++)
-+    {
-+      switch (kp->vcpu.io.size)
-+      {
-+      case 1:
-+	*(u_int8_t *)kp->vcpu.io.ptr = *(u_int8_t *)kp->vcpu.io.user_ptr;
-+	kp->vcpu.io.user_ptr++;
-+	kp->vcpu.io.ptr++;
-+	break;
-+      case 2:
-+	*(u_int16_t *)kp->vcpu.io.ptr = *(u_int16_t *)kp->vcpu.io.user_ptr;
-+	kp->vcpu.io.user_ptr += 2;
-+	kp->vcpu.io.ptr += 2;
-+	break;
-+      case 4:
-+	*(u_int32_t *)kp->vcpu.io.ptr = *(u_int32_t *)kp->vcpu.io.user_ptr;
-+	kp->vcpu.io.user_ptr += 4;
-+	kp->vcpu.io.ptr += 4;
-+	break;
-+      default:
-+	// size unhandled
-+	printf("KVM: prerun I/O op size not handled (%d)\n", run->io.size);
-+	return (-ENXIO);
-+      }
-+    }
-+  }
-+  return (0);
-+}
-+
-+void kvm_handle_io(void *hw, struct kvm_run *run, struct kvm_p *kp)
++void kvm_handle_io(void *hw, struct kvm_run *run, struct kvm_p *kp,
++		   u_int64_t off)
 +{
 +  struct kvm_sregs s;
 +  struct kvm_regs r;
@@ -1798,7 +2128,12 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +  if (kp->vcpu.io.rep)
 +  {
 +    if (kp->vcpu.io.str)
-+      run->io.count = (u_int32_t)r.rcx;
++    {
++      if (off)
++	run->io.count -= (off / kp->vcpu.io.size);
++      else
++	run->io.count = (u_int32_t)r.rcx;
++    }
 +    else
 +    {
 +      printf("KVM: unhandled rep I/O operation on non-string opcode\n");
@@ -1810,15 +2145,15 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +  else
 +    run->io.count = 1;
 +  kp->vcpu.io.count = run->io.count;
-+
++  
 +  // check IO size
 +  if ((kp->vcpu.io.count * kp->vcpu.io.size) > sizeof(run->s))
 +  {
-+    printf("KVM: I/O operation result won't fit in kvm_run struct\n");
-+    run->exit_reason = KVM_EXIT_UNKNOWN;
-+    run->hw.hardware_exit_reason = KVM_EXIT_IO;
-+    return;
++    run->io.count = sizeof(run->s) / kp->vcpu.io.size;
++    kp->vcpu.io.count -= run->io.count;
 +  }
++  else
++    kp->vcpu.io.count = 0;
 +
 +  // string operation
 +  if (kp->vcpu.io.str)
@@ -1895,11 +2230,14 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      }
 +    }
 +
++    // add offset from precedent un-finished operation (if any)
++    val += off;
++    
 +    // check if we need to translate with guest page tables
 +    if (s.cr0 & (1 << 31))
-+      if ((val = kvm_guest_translate(kp, run, s.cr0, s.cr3, s.efer, val)) == 1)
++      if (kvm_guest_translate(kp, run, s.cr0, s.cr3, s.efer, val, &val))
 +	return;
-+    
++
 +    // search the address in our memory mappings
 +    for (i = 0; i < 32; i++)
 +      if (kp->mem[i].used)
@@ -1917,7 +2255,7 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    }
 +    
 +    // check for overflow
-+    if ((val + (kp->vcpu.io.count * kp->vcpu.io.size))
++    if ((val + (run->io.count * kp->vcpu.io.size))
 +	> (kp->mem[i].gpaddr + kp->mem[i].size))
 +    {
 +      printf("KVM: I/O string operation would overflow memory mapping\n");
@@ -1930,11 +2268,11 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +			       (val - kp->mem[i].gpaddr));    
 +  }
 +  else
-+    kp->vcpu.io.ptr = (void *)kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
++    kp->vcpu.io.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
 +
 +  // if out, do the operation
 +  if (kp->vcpu.io.dir == KVM_EXIT_IO_OUT)
-+    for (i = 0; i < kp->vcpu.io.count; i++)
++    for (i = 0; i < run->io.count; i++)
 +      switch (kp->vcpu.io.size)
 +      {
 +      case 1:
@@ -1961,6 +2299,52 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      }
 +}
 +
++int kvm_handle_pre_io(struct kvm_run *run, struct kvm_p *kp)
++{
++  int i;
++
++  kp->vcpu.io.flag = 0;
++  if (kp->vcpu.io.dir == KVM_EXIT_IO_IN)
++  {
++    if (run->exit_reason != KVM_EXIT_IO)
++    {
++      printf("KVM: ERR userland did not fulfill IO access\n");
++      return (-ENXIO);
++    }
++    for (i = 0; i < run->io.count; i++)
++    {
++      switch (kp->vcpu.io.size)
++      {
++      case 1:
++	*(u_int8_t *)kp->vcpu.io.ptr = *(u_int8_t *)kp->vcpu.io.user_ptr;
++	kp->vcpu.io.user_ptr++;
++	kp->vcpu.io.ptr++;
++	break;
++      case 2:
++	*(u_int16_t *)kp->vcpu.io.ptr = *(u_int16_t *)kp->vcpu.io.user_ptr;
++	kp->vcpu.io.user_ptr += 2;
++	kp->vcpu.io.ptr += 2;
++	break;
++      case 4:
++	*(u_int32_t *)kp->vcpu.io.ptr = *(u_int32_t *)kp->vcpu.io.user_ptr;
++	kp->vcpu.io.user_ptr += 4;
++	kp->vcpu.io.ptr += 4;
++	break;
++      default:
++	// size unhandled
++	printf("KVM: prerun I/O op size not handled (%d)\n", run->io.size);
++	return (-ENXIO);
++      }
++    }
++  }
++
++  // operation not finished
++  if (kp->vcpu.io.count)
++    kvm_handle_io(kp->hw_data, run, kp, sizeof(run->s));
++  
++  return (0);
++}
++
 +int kvm_handle_pre_mmio(struct kvm_run *run, struct kvm_p *kp)
 +{
 +  struct kvm_regs r;
@@ -1975,6 +2359,7 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    if (kp->vcpu.mmio.flag & 2)
 +    {
 +      run->mmio.phys_addr = kp->vcpu.mmio.ptr2;
++      run->mmio.len = kp->vcpu.mmio.size;
 +      run->mmio.is_write = 1;
 +      kp->vcpu.mmio.dir = 1;
 +      kp->vcpu.mmio.flag = 1;
@@ -2177,8 +2562,13 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    case KVM_RUN:
 +      // handle MMIO access from userland
 +      if (kp->vcpu.mmio.flag & 1)
++      {
 +	if ((ret = kvm_handle_pre_mmio(kp->vcpu.kr, kp)))
 +	  return (ret);
++	// MMIO to MMIO
++	if (kp->vcpu.mmio.flag & 1)
++	  return (0);
++      }
 +      // handle IO operation from userland
 +      if (kp->vcpu.io.flag & 1)
 +	if ((ret = kvm_handle_pre_io(kp->vcpu.kr, kp)))
@@ -2187,10 +2577,10 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +      ret = kvm_hw->run(kp->hw_data, kp->vcpu.kr, kp, p);
 +      // handle MMIO access to userland
 +      if (kp->vcpu.kr->exit_reason == KVM_EXIT_MMIO)
-+	kvm_handle_mmio(kp->hw_data, kp->vcpu.kr, kp);
++	kvm_handle_mmio(kp->vcpu.kr, kp);
 +      // handle IO operation to userland
 +      if (kp->vcpu.kr->exit_reason == KVM_EXIT_IO)
-+	kvm_handle_io(kp->hw_data, kp->vcpu.kr, kp);
++	kvm_handle_io(kp->hw_data, kp->vcpu.kr, kp, 0);
 +      // update lapic base
 +      kp->vcpu.kr->apic_base = kp->vcpu.lapic;
 +      return (ret);
@@ -2208,91 +2598,29 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/kvm.c kvm-tree/src/sys/arch/amd64
 +    return (-ENODEV);
 +  }
 +}
-diff -Pru stable-tree/src/sys/arch/amd64/amd64/autoconf.c kvm-tree/src/sys/arch/amd64/amd64/autoconf.c
---- stable-tree/src/sys/arch/amd64/amd64/autoconf.c	Sat Nov  5 11:17:44 2016
-+++ kvm-tree/src/sys/arch/amd64/amd64/autoconf.c	Sat Nov  5 11:16:32 2016
-@@ -105,6 +105,9 @@
- extern int	amd64_has_aesni;
- #endif
- 
-+void		svm_setup(void);
-+void		vmx_setup(void);
+diff --git a/sys/arch/amd64/amd64/svm.c b/sys/arch/amd64/amd64/svm.c
+new file mode 100644
+index 0000000..10396c3
+--- /dev/null
++++ b/sys/arch/amd64/amd64/svm.c
+@@ -0,0 +1,1141 @@
++/*
++ * Copyright (c) 2016 Mickael Torres
++ * All rights reserved.
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
 +
- /*
-  * Determine i/o configuration for a machine.
-  */
-@@ -154,6 +157,8 @@
- 	if (amd64_has_aesni)
- 		aesni_setup();
- #endif
-+	svm_setup();
-+	vmx_setup();
- }
- 
- void
-diff -Pru stable-tree/src/sys/arch/amd64/amd64/conf.c kvm-tree/src/sys/arch/amd64/amd64/conf.c
---- stable-tree/src/sys/arch/amd64/amd64/conf.c	Sat Nov  5 11:17:44 2016
-+++ kvm-tree/src/sys/arch/amd64/amd64/conf.c	Sat Nov  5 11:16:32 2016
-@@ -112,6 +112,12 @@
- 	(dev_type_stop((*))) enodev, 0, seltrue, \
- 	(dev_type_mmap((*))) enodev }
- 
-+/* open, close, ioctl, mmap */
-+#define cdev_kvm_init(c,n) {						\
-+    dev_init(c,n,open), dev_init(c,n,close),				\
-+      (dev_type_read((*))) enodev, (dev_type_write((*))) enodev,	\
-+      dev_init(c,n,ioctl), (dev_type_stop((*))) enodev, 0, seltrue, 	\
-+      dev_init(c,n,mmap) }
- 
- #define	mmread	mmrw
- #define	mmwrite	mmrw
-@@ -164,6 +170,8 @@
- cdev_decl(drm);
- #include "viocon.h"
- cdev_decl(viocon);
-+#include "kvm.h"
-+cdev_decl(kvm);
- 
- #include "wsdisplay.h"
- #include "wskbd.h"
-@@ -295,6 +303,7 @@
- 	cdev_tty_init(NVIOCON,viocon),  /* 94: virtio console */
- 	cdev_pvbus_init(NPVBUS,pvbus),	/* 95: pvbus(4) control interface */
- 	cdev_ipmi_init(NIPMI,ipmi),	/* 96: ipmi */
-+	cdev_kvm_init(NKVM,kvm),        /* 97: kvm */
- };
- int	nchrdev = nitems(cdevsw);
- 
-diff -Pru stable-tree/src/sys/arch/amd64/amd64/cpu.c kvm-tree/src/sys/arch/amd64/amd64/cpu.c
---- stable-tree/src/sys/arch/amd64/amd64/cpu.c	Sat Nov  5 11:17:44 2016
-+++ kvm-tree/src/sys/arch/amd64/amd64/cpu.c	Sat Nov  5 11:16:32 2016
-@@ -659,6 +659,9 @@
- 	}
- }
- 
-+void svm_enter(void);
-+void vmx_enter(void);
-+
- /*
-  * The CPU ends up here when it's ready to run
-  * This is called from code in mptramp.s; at this point, we are running
-@@ -736,6 +739,12 @@
- 	nanouptime(&ci->ci_schedstate.spc_runtime);
- 	splx(s);
- 
-+	// setup SVM for this AP
-+	svm_enter();
-+	
-+	// setup VMX for this AP
-+	vmx_enter();
-+	
- 	SCHED_LOCK(s);
- 	cpu_switchto(NULL, sched_chooseproc());
- }
-diff -Pru stable-tree/src/sys/arch/amd64/amd64/svm.c kvm-tree/src/sys/arch/amd64/amd64/svm.c
---- stable-tree/src/sys/arch/amd64/amd64/svm.c	Thu Jan  1 01:00:00 1970
-+++ kvm-tree/src/sys/arch/amd64/amd64/svm.c	Sat Nov  5 14:34:38 2016
-@@ -0,0 +1,1124 @@
 +#include <sys/types.h>
 +#include <sys/param.h>
 +#include <sys/systm.h>
@@ -2808,42 +3136,42 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/svm.c kvm-tree/src/sys/arch/amd64
 +  return (0);
 +}
 +
-+vaddr_t svm_get_reg_ptr(struct v_svm *svm, int reg)
++void *svm_get_reg_ptr(struct v_svm *svm, int reg)
 +{
 +  switch (reg)
 +  {
 +  case KVM_REG_RAX:
-+    return ((vaddr_t)&(svm->vmcb->rax));
++    return ((void *)&(svm->vmcb->rax));
 +  case KVM_REG_RBX:
-+    return ((vaddr_t)&(svm->guest.rbx));
++    return ((void *)&(svm->guest.rbx));
 +  case KVM_REG_RCX:
-+    return ((vaddr_t)&(svm->guest.rcx));
++    return ((void *)&(svm->guest.rcx));
 +  case KVM_REG_RDX:
-+    return ((vaddr_t)&(svm->guest.rdx));
++    return ((void *)&(svm->guest.rdx));
 +  case KVM_REG_RSI:
-+    return ((vaddr_t)&(svm->guest.rsi));
++    return ((void *)&(svm->guest.rsi));
 +  case KVM_REG_RDI:
-+    return ((vaddr_t)&(svm->guest.rdi));
++    return ((void *)&(svm->guest.rdi));
 +  case KVM_REG_RBP:
-+    return ((vaddr_t)&(svm->guest.rbp));
++    return ((void *)&(svm->guest.rbp));
 +  case KVM_REG_R8:
-+    return ((vaddr_t)&(svm->guest.r8));
++    return ((void *)&(svm->guest.r8));
 +  case KVM_REG_R9:
-+    return ((vaddr_t)&(svm->guest.r9));
++    return ((void *)&(svm->guest.r9));
 +  case KVM_REG_R10:
-+    return ((vaddr_t)&(svm->guest.r10));
++    return ((void *)&(svm->guest.r10));
 +  case KVM_REG_R11:
-+    return ((vaddr_t)&(svm->guest.r11));
++    return ((void *)&(svm->guest.r11));
 +  case KVM_REG_R12:
-+    return ((vaddr_t)&(svm->guest.r12));
++    return ((void *)&(svm->guest.r12));
 +  case KVM_REG_R13:
-+    return ((vaddr_t)&(svm->guest.r13));
++    return ((void *)&(svm->guest.r13));
 +  case KVM_REG_R14:
-+    return ((vaddr_t)&(svm->guest.r14));
++    return ((void *)&(svm->guest.r14));
 +  case KVM_REG_R15:
-+    return ((vaddr_t)&(svm->guest.r15));
++    return ((void *)&(svm->guest.r15));
 +  }
-+  return (1);
++  return ((void *)1);
 +}
 +
 +int svm_get_msrs(struct v_svm *svm, struct kvm_msrs *m)
@@ -3417,10 +3745,29 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/svm.c kvm-tree/src/sys/arch/amd64
 +  kvm_svm_ptr.run = (void *)svm_run;
 +  return (&kvm_svm_ptr);
 +}
-diff -Pru stable-tree/src/sys/arch/amd64/amd64/vmx.c kvm-tree/src/sys/arch/amd64/amd64/vmx.c
---- stable-tree/src/sys/arch/amd64/amd64/vmx.c	Thu Jan  1 01:00:00 1970
-+++ kvm-tree/src/sys/arch/amd64/amd64/vmx.c	Sat Nov  5 18:17:02 2016
-@@ -0,0 +1,1756 @@
+diff --git a/sys/arch/amd64/amd64/vmx.c b/sys/arch/amd64/amd64/vmx.c
+new file mode 100644
+index 0000000..594b63a
+--- /dev/null
++++ b/sys/arch/amd64/amd64/vmx.c
+@@ -0,0 +1,1773 @@
++/*
++ * Copyright (c) 2016 Mickael Torres
++ * All rights reserved.
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
 +#include <sys/types.h>
 +#include <sys/param.h>
 +#include <sys/systm.h>
@@ -4249,42 +4596,42 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/vmx.c kvm-tree/src/sys/arch/amd64
 +  return (0);
 +}
 +
-+vaddr_t vmx_get_reg_ptr(struct v_vmx *vmx, int reg)
++void *vmx_get_reg_ptr(struct v_vmx *vmx, int reg)
 +{
 +  switch (reg)
 +  {
 +  case KVM_REG_RAX:
-+    return ((vaddr_t)&(vmx->guest.rax));
++    return ((void *)&(vmx->guest.rax));
 +  case KVM_REG_RBX:
-+    return ((vaddr_t)&(vmx->guest.rbx));
++    return ((void *)&(vmx->guest.rbx));
 +  case KVM_REG_RCX:
-+    return ((vaddr_t)&(vmx->guest.rcx));
++    return ((void *)&(vmx->guest.rcx));
 +  case KVM_REG_RDX:
-+    return ((vaddr_t)&(vmx->guest.rdx));
++    return ((void *)&(vmx->guest.rdx));
 +  case KVM_REG_RSI:
-+    return ((vaddr_t)&(vmx->guest.rsi));
++    return ((void *)&(vmx->guest.rsi));
 +  case KVM_REG_RDI:
-+    return ((vaddr_t)&(vmx->guest.rdi));
++    return ((void *)&(vmx->guest.rdi));
 +  case KVM_REG_RBP:
-+    return ((vaddr_t)&(vmx->guest.rbp));
++    return ((void *)&(vmx->guest.rbp));
 +  case KVM_REG_R8:
-+    return ((vaddr_t)&(vmx->guest.r8));
++    return ((void *)&(vmx->guest.r8));
 +  case KVM_REG_R9:
-+    return ((vaddr_t)&(vmx->guest.r9));
++    return ((void *)&(vmx->guest.r9));
 +  case KVM_REG_R10:
-+    return ((vaddr_t)&(vmx->guest.r10));
++    return ((void *)&(vmx->guest.r10));
 +  case KVM_REG_R11:
-+    return ((vaddr_t)&(vmx->guest.r11));
++    return ((void *)&(vmx->guest.r11));
 +  case KVM_REG_R12:
-+    return ((vaddr_t)&(vmx->guest.r12));
++    return ((void *)&(vmx->guest.r12));
 +  case KVM_REG_R13:
-+    return ((vaddr_t)&(vmx->guest.r13));
++    return ((void *)&(vmx->guest.r13));
 +  case KVM_REG_R14:
-+    return ((vaddr_t)&(vmx->guest.r14));
++    return ((void *)&(vmx->guest.r14));
 +  case KVM_REG_R15:
-+    return ((vaddr_t)&(vmx->guest.r15));
++    return ((void *)&(vmx->guest.r15));
 +  }
-+  return (1);
++  return ((void *)1);
 +}
 +
 +int vmx_get_msrs(struct v_vmx *vmx, struct kvm_msrs *m)
@@ -5177,10 +5524,11 @@ diff -Pru stable-tree/src/sys/arch/amd64/amd64/vmx.c kvm-tree/src/sys/arch/amd64
 +  kvm_vmx_ptr.run = (void *)vmx_run;
 +  return (&kvm_vmx_ptr);
 +}
-diff -Pru stable-tree/src/sys/arch/amd64/conf/GENERIC kvm-tree/src/sys/arch/amd64/conf/GENERIC
---- stable-tree/src/sys/arch/amd64/conf/GENERIC	Sat Nov  5 11:17:44 2016
-+++ kvm-tree/src/sys/arch/amd64/conf/GENERIC	Sat Nov  5 19:48:42 2016
-@@ -637,6 +637,7 @@
+diff --git a/sys/arch/amd64/conf/GENERIC b/sys/arch/amd64/conf/GENERIC
+index 8eb1b13..ce6bddd 100644
+--- a/sys/arch/amd64/conf/GENERIC
++++ b/sys/arch/amd64/conf/GENERIC
+@@ -637,6 +637,7 @@ owctr*	at onewire?		# Counter device
  pseudo-device	pctr		1
  pseudo-device	nvram		1
  pseudo-device	hotplug		1	# devices hot plugging
@@ -5188,10 +5536,11 @@ diff -Pru stable-tree/src/sys/arch/amd64/conf/GENERIC kvm-tree/src/sys/arch/amd6
  
  # mouse & keyboard multiplexor pseudo-devices
  pseudo-device	wsmux		2
-diff -Pru stable-tree/src/sys/arch/amd64/conf/files.amd64 kvm-tree/src/sys/arch/amd64/conf/files.amd64
---- stable-tree/src/sys/arch/amd64/conf/files.amd64	Sat Nov  5 11:17:44 2016
-+++ kvm-tree/src/sys/arch/amd64/conf/files.amd64	Sat Nov  5 11:16:34 2016
-@@ -13,6 +13,8 @@
+diff --git a/sys/arch/amd64/conf/files.amd64 b/sys/arch/amd64/conf/files.amd64
+index 5d58b34..66c9258 100644
+--- a/sys/arch/amd64/conf/files.amd64
++++ b/sys/arch/amd64/conf/files.amd64
+@@ -13,6 +13,8 @@ file	arch/amd64/amd64/identcpu.c
  file	arch/amd64/amd64/via.c
  file	arch/amd64/amd64/aes_intel.S		crypto
  file	arch/amd64/amd64/aesni.c		crypto
@@ -5200,23 +5549,24 @@ diff -Pru stable-tree/src/sys/arch/amd64/conf/files.amd64 kvm-tree/src/sys/arch/
  file	arch/amd64/amd64/amd64errata.c
  file	arch/amd64/amd64/mem.c
  file	arch/amd64/amd64/amd64_mem.c		mtrr
-@@ -238,6 +240,12 @@
- attach vmm at mainbus
- file	arch/amd64/amd64/vmm.c			vmm		needs-flag
+@@ -240,6 +242,12 @@ file	arch/amd64/amd64/vmm.c			vmm		needs-flag
  file	arch/amd64/amd64/vmm_support.S		vmm
-+
-+#
+ 
+ #
 +# KVM
 +#
 +pseudo-device	kvm
 +file   arch/amd64/amd64/kvm.c			kvm		needs-flag
- 
- #
++
++#
  # Machine-independent SD/MMC drivers
-diff -Pru stable-tree/src/sys/arch/amd64/include/cpu.h kvm-tree/src/sys/arch/amd64/include/cpu.h
---- stable-tree/src/sys/arch/amd64/include/cpu.h	Sat Nov  5 11:17:44 2016
-+++ kvm-tree/src/sys/arch/amd64/include/cpu.h	Sat Nov  5 11:16:34 2016
-@@ -183,6 +183,9 @@
+ #
+ include "dev/sdmmc/files.sdmmc"
+diff --git a/sys/arch/amd64/include/cpu.h b/sys/arch/amd64/include/cpu.h
+index 809766a..e28f075 100644
+--- a/sys/arch/amd64/include/cpu.h
++++ b/sys/arch/amd64/include/cpu.h
+@@ -183,6 +183,9 @@ struct cpu_info {
  	union		vmm_cpu_cap ci_vmm_cap;
  	paddr_t		ci_vmxon_region_pa;
  	struct vmxon_region *ci_vmxon_region;
@@ -5226,10 +5576,12 @@ diff -Pru stable-tree/src/sys/arch/amd64/include/cpu.h kvm-tree/src/sys/arch/amd
  };
  
  #define CPUF_BSP	0x0001		/* CPU is the original BSP */
-diff -Pru stable-tree/src/sys/arch/amd64/include/kvm.h kvm-tree/src/sys/arch/amd64/include/kvm.h
---- stable-tree/src/sys/arch/amd64/include/kvm.h	Thu Jan  1 01:00:00 1970
-+++ kvm-tree/src/sys/arch/amd64/include/kvm.h	Sat Nov  5 13:40:10 2016
-@@ -0,0 +1,1031 @@
+diff --git a/sys/arch/amd64/include/kvm.h b/sys/arch/amd64/include/kvm.h
+new file mode 100644
+index 0000000..42a966a
+--- /dev/null
++++ b/sys/arch/amd64/include/kvm.h
+@@ -0,0 +1,1032 @@
 +#ifndef _MACHINE_KVM_H_
 +#define _MACHINE_KVM_H_
 +
@@ -5298,6 +5650,7 @@ diff -Pru stable-tree/src/sys/arch/amd64/include/kvm.h kvm-tree/src/sys/arch/amd
 +#define PRFX_REXB 32
 +#define PRFX_REXW 64
 +#define PRFX_REXX 128
++#define PRFX_REX 256
 +
 +#define KVM_VIRT_NONE 0
 +#define KVM_VIRT_SVM 1
@@ -6253,7 +6606,7 @@ diff -Pru stable-tree/src/sys/arch/amd64/include/kvm.h kvm-tree/src/sys/arch/amd
 +  int (*set_fpu)(void *, struct kvm_fpu *);
 +  int (*get_sregs)(void *, struct kvm_sregs *, struct kvm_p *);
 +  int (*set_sregs)(void *, struct kvm_sregs *, struct kvm_p *);
-+  vaddr_t (*get_reg_ptr)(void *, int);
++  void* (*get_reg_ptr)(void *, int);
 +  int (*get_msrs)(void *, struct kvm_msrs *);
 +  int (*set_msrs)(void *, struct kvm_msrs *);
 +  int (*set_intr)(void *, u_int32_t);
@@ -6261,9 +6614,11 @@ diff -Pru stable-tree/src/sys/arch/amd64/include/kvm.h kvm-tree/src/sys/arch/amd
 +};
 +
 +#endif /* !_MACHINE_KVM_H_ */
-diff -Pru stable-tree/src/sys/arch/amd64/include/svm.h kvm-tree/src/sys/arch/amd64/include/svm.h
---- stable-tree/src/sys/arch/amd64/include/svm.h	Thu Jan  1 01:00:00 1970
-+++ kvm-tree/src/sys/arch/amd64/include/svm.h	Sat Nov  5 12:47:19 2016
+diff --git a/sys/arch/amd64/include/svm.h b/sys/arch/amd64/include/svm.h
+new file mode 100644
+index 0000000..d5dc00c
+--- /dev/null
++++ b/sys/arch/amd64/include/svm.h
 @@ -0,0 +1,261 @@
 +#ifndef _MACHINE_SVM_H_
 +#define _MACHINE_SVM_H_
@@ -6526,9 +6881,11 @@ diff -Pru stable-tree/src/sys/arch/amd64/include/svm.h kvm-tree/src/sys/arch/amd
 +  }
 +
 +#endif /* !_MACHINE_SVM_H_ */
-diff -Pru stable-tree/src/sys/arch/amd64/include/vmx.h kvm-tree/src/sys/arch/amd64/include/vmx.h
---- stable-tree/src/sys/arch/amd64/include/vmx.h	Thu Jan  1 01:00:00 1970
-+++ kvm-tree/src/sys/arch/amd64/include/vmx.h	Sat Nov  5 12:47:09 2016
+diff --git a/sys/arch/amd64/include/vmx.h b/sys/arch/amd64/include/vmx.h
+new file mode 100644
+index 0000000..c85422f
+--- /dev/null
++++ b/sys/arch/amd64/include/vmx.h
 @@ -0,0 +1,292 @@
 +#ifndef _MACHINE_VMX_H_
 +#define _MACHINE_VMX_H_
@@ -6822,22 +7179,22 @@ diff -Pru stable-tree/src/sys/arch/amd64/include/vmx.h kvm-tree/src/sys/arch/amd
 +struct kvm_hw_ptr *vmx_get_hw(void);
 +
 +#endif /* !_MACHINE_VMX_H_ */
-diff -Pru stable-tree/src/sys/sys/proc.h kvm-tree/src/sys/sys/proc.h
---- stable-tree/src/sys/sys/proc.h	Sat Nov  5 11:17:47 2016
-+++ kvm-tree/src/sys/sys/proc.h	Sat Nov  5 11:16:37 2016
-@@ -270,7 +270,11 @@
+diff --git a/sys/sys/proc.h b/sys/sys/proc.h
+index 7c3b7f0..ceae2e5 100644
+--- a/sys/sys/proc.h
++++ b/sys/sys/proc.h
+@@ -270,6 +270,10 @@ struct process {
       "\017NOZOMBIE" "\020STOPPED" "\021SYSTEM" "\022EMBRYO" "\023ZOMBIE" \
       "\024NOBROADCASTKILL" "\025PLEDGE")
  
 +#ifdef __amd64__
 +struct kvm_p;
 +#endif
- 
 +
+ 
  struct proc {
  	TAILQ_ENTRY(proc) p_runq;
- 	LIST_ENTRY(proc) p_list;	/* List of all threads. */
-@@ -318,6 +322,9 @@
+@@ -318,6 +322,9 @@ struct proc {
  	void	*p_emuldata;		/* Per-process emulation data, or */
  					/* NULL. Malloc type M_EMULDATA */
  	int	 p_siglist;		/* Signals arrived but not delivered. */
