@@ -20,7 +20,7 @@ Known caveats:
  - quick and dirty code :D
  - the IO/MMIO instruction emulation is, at best, a hack
  - sometimes to install debian on intel CPU, it is needed to kill a modprobe btrfs process
-~~ - text and VGA console doesn't refresh well, the culprit would be, IO/MMIO emulation and/or the KVM_GET_DIRTY_LOG ioctl~~ fixed with dirty log patch
+ - ~~text and VGA console doesn't refresh well, the culprit would be, IO/MMIO emulation and/or the KVM_GET_DIRTY_LOG ioctl~~ fixed with dirty log patch
  - ...
 
 Compile the kernel with the patch:
