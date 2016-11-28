@@ -84,10 +84,10 @@ index c1dedf9..f9bccc0 100644
  }
 diff --git a/sys/arch/amd64/amd64/kvm.c b/sys/arch/amd64/amd64/kvm.c
 new file mode 100644
-index 0000000..1506daa
+index 0000000..9c26596
 --- /dev/null
 +++ b/sys/arch/amd64/amd64/kvm.c
-@@ -0,0 +1,2763 @@
+@@ -0,0 +1,2743 @@
 +/*
 + * Copyright (c) 2016 Mickael Torres
 + * All rights reserved.
@@ -1063,8 +1063,8 @@ index 0000000..1506daa
 +  // if paging is enabled, we have to go through guest pml4/pde
 +  if (s->cr0 & (1 << 31))
 +  {
-+    // protected mode paging
-+    if (!(s->efer & (1 << 8)))
++    // pae paging
++    if (!((s->efer & (1 << 10)) && s->cs.l && !s->cs.db))
 +      return (kvm_guest_translate_pae(kp, run, s, v, ret));
 +    
 +    // long mode paging
@@ -1293,11 +1293,13 @@ index 0000000..1506daa
 +
 +int kvm_emul_modrm(struct kvm_p *kp, struct kvm_run *run,
 +		   u_int8_t *modrm,
-+		   u_int32_t prfx, u_int64_t rip, u_int32_t addr_size,
-+		   u_int32_t op_size, u_int64_t cr0)
++		   u_int32_t prfx, u_int64_t rip,
++		   u_int32_t op_size, struct kvm_sregs *s)
 +{
-+  //  if protection not enabled, use 16 bits modrm
-+  if (!(cr0 & 1))
++  //  if protection not enabled, use 16 bits modrm, or protected 16bits
++  if (!(s->cr0 & 1) ||
++      (!(s->efer & (1 << 10)) && !s->cs.db) ||
++      ((s->efer & (1 << 10)) && !s->cs.l && !s->cs.db))
 +    return (kvm_emul_modrm16(kp, modrm, op_size));
 +  
 +  switch (*modrm) // MODRM
@@ -1305,7 +1307,7 @@ index 0000000..1506daa
 +    // RAX / R8
 +  case 0x80 ... 0x87:
 +  case 0x05:
-+    kp->vcpu.insn_len += (addr_size - 1);
++    kp->vcpu.insn_len += 3;
 +  case 0x40 ... 0x43:
 +  case 0x45 ... 0x47:
 +    kp->vcpu.insn_len += 1;
@@ -1340,7 +1342,7 @@ index 0000000..1506daa
 +    // RCX / R9
 +  case 0x88 ... 0x8f:
 +  case 0x0d:
-+    kp->vcpu.insn_len += (addr_size - 1);
++    kp->vcpu.insn_len += 3;
 +  case 0x48 ... 0x4b:
 +  case 0x4d ... 0x4f:
 +    kp->vcpu.insn_len += 1;
@@ -1375,7 +1377,7 @@ index 0000000..1506daa
 +    // RDX / R10
 +  case 0x90 ... 0x97:
 +  case 0x15:
-+    kp->vcpu.insn_len += (addr_size - 1);
++    kp->vcpu.insn_len += 3;
 +  case 0x50 ... 0x53:
 +  case 0x55 ... 0x57:
 +    kp->vcpu.insn_len += 1;
@@ -1410,7 +1412,7 @@ index 0000000..1506daa
 +    // RBX / R11
 +  case 0x98 ... 0x9f:
 +  case 0x1d:
-+    kp->vcpu.insn_len += (addr_size - 1);
++    kp->vcpu.insn_len += 3;
 +  case 0x58 ... 0x5b:
 +  case 0x5d ... 0x5f:
 +    kp->vcpu.insn_len += 1;
@@ -1445,7 +1447,7 @@ index 0000000..1506daa
 +    // RSP / R12
 +  case 0xa0 ... 0xa7:
 +  case 0x25:
-+    kp->vcpu.insn_len += (addr_size - 1);
++    kp->vcpu.insn_len += 3;
 +  case 0x60 ... 0x63:
 +  case 0x65 ... 0x67:
 +    kp->vcpu.insn_len += 1;
@@ -1524,7 +1526,7 @@ index 0000000..1506daa
 +    // RBP / R13
 +  case 0xa8 ... 0xaf:
 +  case 0x2d:
-+    kp->vcpu.insn_len += (addr_size - 1);
++    kp->vcpu.insn_len += 3;
 +  case 0x68 ... 0x6b:
 +  case 0x6d ... 0x6f:
 +    kp->vcpu.insn_len += 1;
@@ -1574,7 +1576,7 @@ index 0000000..1506daa
 +    // RSI / R14
 +  case 0xb0 ... 0xb7:
 +  case 0x35:
-+    kp->vcpu.insn_len += (addr_size - 1);
++    kp->vcpu.insn_len += 3;
 +  case 0x70 ... 0x73:
 +  case 0x75 ... 0x77:
 +    kp->vcpu.insn_len += 1;
@@ -1624,7 +1626,7 @@ index 0000000..1506daa
 +    // RDI / R15
 +  case 0xb8 ... 0xbf:
 +  case 0x3d:
-+    kp->vcpu.insn_len += (addr_size - 1);
++    kp->vcpu.insn_len += 3;
 +  case 0x78 ... 0x7b:
 +  case 0x7d ... 0x7f:
 +    kp->vcpu.insn_len += 1;
@@ -1682,6 +1684,188 @@ index 0000000..1506daa
 +  return (0);
 +}
 +
++void kvm_emul_prefix_decode(u_int8_t **insn, u_int32_t *prfx)
++{
++  while (1)
++  {
++    if (**insn == 0x26) // ES
++    {
++      *prfx |= PRFX_SEG_ES;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x40) // REX
++    {
++      *prfx |= PRFX_REX;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x41) // REX.B
++    {
++      *prfx |= PRFX_REXB;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x42) // REX.X
++    {
++      *prfx |= PRFX_REXX;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x43) // REX.XB
++    {
++      *prfx |= PRFX_REXX | PRFX_REXB;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x44) // REX.R
++    {
++      *prfx |= PRFX_REXR;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x45) // REX.RB
++    {
++      *prfx |= PRFX_REXR | PRFX_REXB;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x46) // REX.RX
++    {
++      *prfx |= PRFX_REXR | PRFX_REXX;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x47) // REX.RXB
++    {
++      *prfx |= PRFX_REXR | PRFX_REXX | PRFX_REXB;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x48) // REX.W
++    {
++      *prfx |= PRFX_REXW;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x49) // REX.WB
++    {
++      *prfx |= PRFX_REXW | PRFX_REXB;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x4a) // REX.WX
++    {
++      *prfx |= PRFX_REXW | PRFX_REXX;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x4b) // REX.WXB
++    {
++      *prfx |= PRFX_REXW | PRFX_REXX | PRFX_REXB;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x4c) // REX.WR
++    {
++      *prfx |= PRFX_REXW | PRFX_REXR;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x4d) // REX.WRB
++    {
++      *prfx |= PRFX_REXW | PRFX_REXR | PRFX_REXB;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x4e) // REX.WRX
++    {
++      *prfx |= PRFX_REXW | PRFX_REXR | PRFX_REXX;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x4f) // REX.WRXB
++    {
++      *prfx |= PRFX_REXW | PRFX_REXR | PRFX_REXX | PRFX_REXB;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x66) // OPSIZE
++    {
++      *prfx |= PRFX_OPSIZE;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0x67) // ADDRSIZE
++    {
++      *prfx |= PRFX_ADDRSIZE;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0xf2) // REP
++    {
++      *prfx |= PRFX_REP;
++      (*insn)++;
++      continue;
++    }
++    if (**insn == 0xf3) // REP
++    {
++      *prfx |= PRFX_REP;
++      (*insn)++;
++      continue;
++    }
++    break;
++  }
++}
++
++void kvm_emul_get_size(struct kvm_p *kp, struct kvm_sregs *s,
++		       u_int32_t *op_size, u_int32_t *addr_size,
++		       u_int32_t prfx)
++{
++  // size
++  if (s->cr0 & 1) // PE
++  {
++    if ((s->efer & (1 << 10)) && s->cs.l)
++    {
++      *op_size = kp->vcpu.mmio.size = 4;
++      *addr_size = 8;
++    }
++    else
++    {
++      if (s->cs.db) // default size
++	*op_size = *addr_size = kp->vcpu.mmio.size = 4;
++      else
++	*op_size = *addr_size = kp->vcpu.mmio.size = 2;
++    }
++  }
++  else
++    *op_size = *addr_size = kp->vcpu.mmio.size = 2;
++
++  if (prfx & PRFX_OPSIZE)
++  {
++    if (*op_size == 2)
++      *op_size = kp->vcpu.mmio.size = 4;
++    else
++      if (*op_size == 4)
++	*op_size = kp->vcpu.mmio.size = 2;
++  }
++
++  if (prfx & PRFX_ADDRSIZE)
++  {
++    if (*addr_size == 2)
++      *addr_size = 4;
++    else
++      if (*addr_size == 4)
++	*addr_size = 2;
++      else
++	if (*addr_size == 8)
++	  *addr_size = 4;
++  }
++  
++  if (prfx & PRFX_REXW)
++    kp->vcpu.mmio.size = *op_size = 8;
++}
++
 +void kvm_handle_mmio(struct kvm_run *run, struct kvm_p *kp)
 +{
 +  struct kvm_sregs s;
@@ -1691,9 +1875,9 @@ index 0000000..1506daa
 +  u_int32_t prfx;
 +  u_int64_t rip;
 +  u_int8_t *insn;
-+  u_int8_t insn_buf[16];
 +  u_int64_t val;
 +  u_int64_t val2;
++  int64_t signext;
 +  int i;
 +  int j;
 +
@@ -1727,21 +1911,9 @@ index 0000000..1506daa
 +  // instruction is at CS:RIP
 +  rip = s.cs.base + r.rip;
 +
-+  val = 0;
 +  // check if we need to translate guest paging
 +  if (kvm_guest_translate(kp, run, &s, rip, &rip))
 +    return;
-+  // check if insn is potentially at page boundary
-+  // TODO: check guest page size
-+  // TODO: maybe make a getter for insn bytes that can check for page bound
-+  // do not enable for now
-+# if 0
-+  if ((rip / PAGE_SIZE) != ((rip + 15) / PAGE_SIZE))
-+  {
-+    if (kvm_guest_translate(kp, run, &s, rip + 15, &val))
-+      return;
-+  }
-+#endif
 +
 +  // search mappings
 +  for (i = 0; i < 32; i++)
@@ -1759,199 +1931,16 @@ index 0000000..1506daa
 +    return;
 +  }
 +
-+  // search mappings for rip + 15
-+  if (val)
-+  {
-+    // save first mappings
-+    prfx = i;
-+    
-+    // search mappings
-+    for (i = 0; i < 32; i++)
-+      if (kp->mem[i].used)
-+	if ((val >= kp->mem[i].gpaddr) &&
-+	    (val <= (kp->mem[i].gpaddr + kp->mem[i].size)))
-+	  break;
-+
-+    // not found
-+    if (i == 32)
-+    {
-+      printf("KVM: can't find RIP + 15 in memory mappings\n");
-+      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = 20;
-+      return;
-+    }
-+
-+    // copy to local buffer
-+    memcpy(insn_buf,
-+	   (void *)(kp->mem[prfx].vaddr + (rip - kp->mem[prfx].gpaddr)),
-+	   15 - ((rip + 15) % PAGE_SIZE));
-+    memcpy(insn_buf + 15 - ((rip + 15) % PAGE_SIZE),
-+	   (void *)(kp->mem[i].vaddr + (val - kp->mem[i].gpaddr)),
-+	   ((rip + 15) % PAGE_SIZE));
-+    insn = insn_buf;
-+  }
-+  else
-+  {
-+    // our instruction pointer
-+    insn = (void *)(kp->mem[i].vaddr + (rip - kp->mem[i].gpaddr));
-+  }
++  // our instruction pointer
++  insn = (void *)(kp->mem[i].vaddr + (rip - kp->mem[i].gpaddr));
 +
 +  // direction
 +  kp->vcpu.mmio.dir = (kp->vcpu.mmio.acc >> 1) & 1;
-+
-+  // size
-+  // TODO: complete with 8 and 64 bits
-+  if (s.cr0 & 1) // PE
-+    op_size = addr_size = kp->vcpu.mmio.size = 4;
-+  else
-+    op_size = addr_size = kp->vcpu.mmio.size = 2;
 +  
 +  // instruction decoding
 +  prfx = 0;
-+  while (1)
-+  {
-+    if (*insn == 0xf2) // REP
-+    {
-+      prfx |= PRFX_REP;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0xf3) // REP
-+    {
-+      prfx |= PRFX_REP;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x26) // ES
-+    {
-+      prfx |= PRFX_SEG_ES;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x40) // REX
-+    {
-+      prfx |= PRFX_REX;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x41) // REX.B
-+    {
-+      prfx |= PRFX_REXB;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x42) // REX.X
-+    {
-+      prfx |= PRFX_REXX;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x43) // REX.XB
-+    {
-+      prfx |= PRFX_REXX | PRFX_REXB;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x44) // REX.R
-+    {
-+      prfx |= PRFX_REXR;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x45) // REX.RB
-+    {
-+      prfx |= PRFX_REXR | PRFX_REXB;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x46) // REX.RX
-+    {
-+      prfx |= PRFX_REXR | PRFX_REXX;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x47) // REX.RXB
-+    {
-+      prfx |= PRFX_REXR | PRFX_REXX | PRFX_REXB;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x48) // REX.W
-+    {
-+      prfx |= PRFX_REXW;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x49) // REX.WB
-+    {
-+      prfx |= PRFX_REXW | PRFX_REXB;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x4a) // REX.WX
-+    {
-+      prfx |= PRFX_REXW | PRFX_REXX;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x4b) // REX.WXB
-+    {
-+      prfx |= PRFX_REXW | PRFX_REXX | PRFX_REXB;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x4c) // REX.WR
-+    {
-+      prfx |= PRFX_REXW | PRFX_REXR;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x4d) // REX.WRB
-+    {
-+      prfx |= PRFX_REXW | PRFX_REXR | PRFX_REXB;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x4e) // REX.WRX
-+    {
-+      prfx |= PRFX_REXW | PRFX_REXR | PRFX_REXX;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x4f) // REX.WRXB
-+    {
-+      prfx |= PRFX_REXW | PRFX_REXR | PRFX_REXX | PRFX_REXB;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x66) // OPSIZE
-+    {
-+      prfx |= PRFX_OPSIZE;
-+      if (op_size == 2)
-+	op_size = kp->vcpu.mmio.size = 4;
-+      else
-+	if (op_size == 4)
-+	  op_size = kp->vcpu.mmio.size = 2;
-+      insn++;
-+      continue;
-+    }
-+    if (*insn == 0x67) // ADDRSIZE
-+    {
-+      prfx |= PRFX_ADDRSIZE;
-+      if (addr_size == 2)
-+	addr_size = 4;
-+      else
-+	if (addr_size == 4)
-+	  addr_size = 2;
-+      insn++;
-+      continue;
-+    }
-+    break;
-+  }
-+
-+  if (prfx & PRFX_REXW)
-+    kp->vcpu.mmio.size = op_size = 8;
-+
++  kvm_emul_prefix_decode(&insn, &prfx);
++  kvm_emul_get_size(kp, &s, &op_size, &addr_size, prfx);
 +  kp->vcpu.mmio.flag = KVM_MMIO_MOV;
 +  
 +  switch (*insn)
@@ -1968,7 +1957,7 @@ index 0000000..1506daa
 +    kp->vcpu.insn_len = 2;
 +    kp->vcpu.mmio.flag = KVM_MMIO_OR;
 +    op_size = kp->vcpu.mmio.size = 1;
-+    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, addr_size, op_size,s.cr0))
++    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, op_size, &s))
 +      return;
 +    break;
 +    
@@ -1987,12 +1976,14 @@ index 0000000..1506daa
 +	return;
 +      }
 +      kp->vcpu.insn_len = 3;
-+      if (kvm_emul_modrm(kp, run, insn + 2, prfx, rip,addr_size,op_size,s.cr0))
++      if (kvm_emul_modrm(kp, run, insn + 2, prfx, rip, op_size, &s))
 +	return;
-+      if (prfx & PRFX_REXW)
++      if (op_size == 8)
 +	*(u_int64_t *)(kp->vcpu.mmio.ptr) = 0;
-+      else
++      if (op_size == 4)
 +	*(u_int32_t *)(kp->vcpu.mmio.ptr) = 0;
++      if (op_size == 2)
++	*(u_int16_t *)(kp->vcpu.mmio.ptr) = 0;
 +      break;
 +    default:
 +      printf("KVM: insn decoder unknown opcode @%llx "
@@ -2015,7 +2006,7 @@ index 0000000..1506daa
 +    }
 +    kp->vcpu.insn_len = 2;
 +    kp->vcpu.mmio.flag = KVM_MMIO_AND;
-+    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, addr_size, op_size,s.cr0))
++    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, op_size, &s))
 +      return;
 +    break;
 +
@@ -2045,20 +2036,7 @@ index 0000000..1506daa
 +    break;
 +    
 +  case 0x88: // MOV [R/IMM8], R
-+    if (!kp->vcpu.mmio.dir)
-+    {
-+      printf("KVM: opcode @%llx [%02x] is a write, exit is a read\n",
-+	     rip, *insn);
-+      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = 27;
-+      return;
-+    }
-+    kp->vcpu.insn_len = 2;
 +    op_size = kp->vcpu.mmio.size = 1;
-+    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, addr_size, op_size,s.cr0))
-+      return;
-+    break;
-+
 +  case 0x89: // MOV [R/IMM16/32], R
 +    if (!kp->vcpu.mmio.dir)
 +    {
@@ -2069,25 +2047,12 @@ index 0000000..1506daa
 +      return;
 +    }
 +    kp->vcpu.insn_len = 2;
-+    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, addr_size, op_size,s.cr0))
++    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, op_size, &s))
 +      return;
 +    break;
 +
 +  case 0x8a: // MOV R8, [R/M8]
-+    if (kp->vcpu.mmio.dir)
-+    {
-+      printf("KVM: opcode @%llx [%02x] is a read, exit is a write\n",
-+	     rip, *insn);
-+      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = 29;
-+      return;
-+    }
-+    kp->vcpu.insn_len = 2;
 +    op_size = kp->vcpu.mmio.size = 1;
-+    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, addr_size, op_size,s.cr0))
-+      return;
-+    break;
-+    
 +  case 0x8b: // MOV R, [IMM16/32]
 +    if (kp->vcpu.mmio.dir)
 +    {
@@ -2098,7 +2063,7 @@ index 0000000..1506daa
 +      return;
 +    }
 +    kp->vcpu.insn_len = 2;
-+    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, addr_size, op_size,s.cr0))
++    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, op_size, &s))
 +      return;
 +    break;
 +
@@ -2111,12 +2076,11 @@ index 0000000..1506daa
 +      run->hw.hardware_exit_reason = 31;
 +      return;
 +    }
-+    //    kp->vcpu.mmio.size = 4;
 +    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
-+    kp->vcpu.insn_len = kp->vcpu.mmio.size + 1;
++    kp->vcpu.insn_len = addr_size + 1;
 +    break;
 +    
-+  case 0xa3: // MOV [OFF16/32], [E]AX
++  case 0xa3: // MOV [OFF16/32/64], [R]AX
 +    if (!kp->vcpu.mmio.dir)
 +    {
 +      printf("KVM: opcode @%llx [%02x] is a write, exit is a read\n",
@@ -2128,12 +2092,16 @@ index 0000000..1506daa
 +    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
 +    kp->vcpu.insn_len = addr_size + 1;
 +    break;
-+    
++
 +  case 0xa4: // MOVSB
-+    kp->vcpu.mmio.size = 1;
++    op_size = kp->vcpu.mmio.size = 1;
 +  case 0xa5: // MOVSL
-+    val = s.ds.base + (r.rsi & ((addr_size == 2) ? 0xffff : 0xffffffff));
-+    val2 = s.es.base + (r.rdi & ((addr_size == 2) ? 0xffff : 0xffffffff));
++    val = s.ds.base + (r.rsi & ((addr_size == 2) ? 0xffff :
++				((addr_size == 4) ? 0xffffffff :
++				 0xffffffffffffffff)));
++    val2 = s.es.base + (r.rdi & ((addr_size == 2) ? 0xffff :
++				 ((addr_size == 4) ? 0xffffffff :
++				  0xffffffffffffffff)));
 +    if (kvm_guest_translate(kp, run, &s, val, &val))
 +      return;
 +    if (kvm_guest_translate(kp, run, &s, val2, &val2))
@@ -2142,12 +2110,12 @@ index 0000000..1506daa
 +    for (i = 0; i < 32; i++)
 +      if (kp->mem[i].used)
 +	if ((val >= kp->mem[i].gpaddr) &&
-+	    (val <= (kp->mem[i].gpaddr + kp->mem[i].size)))
++	    (val < (kp->mem[i].gpaddr + kp->mem[i].size)))
 +	  break;
 +    for (j = 0; j < 32; j++)
 +      if (kp->mem[j].used)
 +	if ((val2 >= kp->mem[j].gpaddr) &&
-+	    (val2 <= (kp->mem[j].gpaddr + kp->mem[j].size)))
++	    (val2 < (kp->mem[j].gpaddr + kp->mem[j].size)))
 +	  break;
 +    // MMIO to MMIO
 +    if ((i == 32) && (j == 32))
@@ -2236,11 +2204,16 @@ index 0000000..1506daa
 +      run->hw.hardware_exit_reason = 35;
 +      return;
 +    }
-+    kp->vcpu.insn_len = 2 + kp->vcpu.mmio.size;
-+    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, addr_size, op_size,s.cr0))
++    val = (kp->vcpu.mmio.size != 8) ? kp->vcpu.mmio.size : 4;
++    kp->vcpu.insn_len = 2 + val;
++    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, op_size, &s))
 +      return;
-+    kp->vcpu.mmio.ptr = (void *)(insn + kp->vcpu.insn_len -
-+				 kp->vcpu.mmio.size);
++    kp->vcpu.mmio.ptr = (void *)(insn + kp->vcpu.insn_len - val);
++    if (prfx & PRFX_REXW)
++    {
++      signext = *(int32_t *)(insn + kp->vcpu.insn_len - val);
++      kp->vcpu.mmio.ptr = (void *)&signext;
++    }
 +    break;
 +    
 +  default: // opcode not handled yet
@@ -2266,17 +2239,24 @@ index 0000000..1506daa
 +
 +  if (prfx & PRFX_REP)
 +  {
-+    r.rcx--;
 +    switch (addr_size)
 +    {
 +    case 2:
++      (*(u_int16_t *)(&r.rcx))--;
 +      if (!(r.rcx & 0xffff))
 +	kp->vcpu.insn_len++;
 +      else
 +	kp->vcpu.insn_len = 0;
 +      break;
 +    case 4:
++      (*(u_int32_t *)(&r.rcx))--;
 +      if (!(r.rcx & 0xffffffff))
++	kp->vcpu.insn_len++;
++      else
++	kp->vcpu.insn_len = 0;
++    case 8:
++      (*(u_int64_t *)(&r.rcx))--;
++      if (!r.rcx)
 +	kp->vcpu.insn_len++;
 +      else
 +	kp->vcpu.insn_len = 0;
