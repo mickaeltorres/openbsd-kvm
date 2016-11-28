@@ -14,6 +14,8 @@ The following guests have been tested:
  - OpenBSD 6.0 amd64: installs / works
  - FreeBSD 11.0-RC3 amd64: installs / works without -M q35
  - Debian 8.6.0 amd64: installs / works
+ - TinyCore 7.6 i386 non-PAE: installs / works
+ - Debian 8.6.0 i386 PAE: installs / works
 
 Known caveats:
  - only one vCPU supported

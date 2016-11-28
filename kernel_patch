@@ -84,10 +84,10 @@ index c1dedf9..f9bccc0 100644
  }
 diff --git a/sys/arch/amd64/amd64/kvm.c b/sys/arch/amd64/amd64/kvm.c
 new file mode 100644
-index 0000000..c7c2d92
+index 0000000..f169fe3
 --- /dev/null
 +++ b/sys/arch/amd64/amd64/kvm.c
-@@ -0,0 +1,2510 @@
+@@ -0,0 +1,2763 @@
 +/*
 + * Copyright (c) 2016 Mickael Torres
 + * All rights reserved.
@@ -875,27 +875,201 @@ index 0000000..c7c2d92
 +  return (-err);
 +}
 +
-+u_int64_t kvm_guest_translate(struct kvm_p *kp, struct kvm_run *run,
-+			      u_int64_t cr0, u_int64_t cr3, u_int64_t efer,
-+			      u_int64_t v, u_int64_t *ret)
++u_int64_t kvm_guest_translate_32(struct kvm_p *kp, struct kvm_run *run,
++				 struct kvm_sregs *s, u_int64_t v,
++				 u_int64_t *ret)
 +{
++  u_int64_t cr3;
++  int i;
++  
++  // protected mode paging
++  cr3 = s->cr3 & 0xfffff000;
++  v &= 0xffffffff;
++  
++  // search mappings for pd
++  for (i = 0; i < 32; i++)
++    if (kp->mem[i].used)
++      if ((cr3 >= kp->mem[i].gpaddr) &&
++	  (cr3 <= (kp->mem[i].gpaddr + kp->mem[i].size)))
++	break;
++  // not found
++  if (i == 32)
++  {
++    printf("KVM: can't find PD in memory mappings\n");
++    run->exit_reason = KVM_EXIT_UNKNOWN;
++    run->hw.hardware_exit_reason = 43;
++    return (1);
++  }
++  cr3 = kp->mem[i].vaddr + (cr3 - kp->mem[i].gpaddr);
++  cr3 = ((u_int32_t *)(cr3))[(v >> 22) & 0x3ff];
++  if (!(cr3 & 1))
++  {
++    printf("KVM: PD entry not present in memory mappings\n");
++    run->exit_reason = KVM_EXIT_UNKNOWN;
++    run->hw.hardware_exit_reason = 44;
++    return (1);
++  }
++
++  if (cr3 & (1 << 7)) // 4MB page
++  {
++    cr3 &= 0xffc00000;
++    v = cr3 + (v & 0x3fffff);
++  }
++  else
++  {
++    cr3 &= 0xfffff000;
++    // search mappings for pt
++    for (i = 0; i < 32; i++)
++      if (kp->mem[i].used)
++	if ((cr3 >= kp->mem[i].gpaddr) &&
++	    (cr3 <= (kp->mem[i].gpaddr + kp->mem[i].size)))
++	  break;
++    // not found
++    if (i == 32)
++    {
++      printf("KVM: can't find PT in memory mappings\n");
++      run->exit_reason = KVM_EXIT_UNKNOWN;
++      run->hw.hardware_exit_reason = 45;
++      return (1);
++    }
++    cr3 = kp->mem[i].vaddr + (cr3 - kp->mem[i].gpaddr);
++    cr3 = ((u_int32_t *)(cr3))[(v >> 12) & 0x3ff];
++    if (!(cr3 & 1))
++    {
++      printf("KVM: PT entry not present in memory mappings\n");
++      run->exit_reason = KVM_EXIT_UNKNOWN;
++      run->hw.hardware_exit_reason = 46;
++      return (1);
++    }
++    
++    cr3 &= 0xfffff000;
++    v = cr3 + (v & 0xfff);
++  }
++
++  *ret = v;
++  return (0);
++}
++
++u_int64_t kvm_guest_translate_pae(struct kvm_p *kp, struct kvm_run *run,
++				  struct kvm_sregs *s, u_int64_t v,
++				  u_int64_t *ret)
++{
++  u_int64_t cr3;
++  int i;
++
++  // protected mode paging
++  if (!(s->cr4 & (1 << 5)))
++    return (kvm_guest_translate_32(kp, run, s, v, ret));
++
++  // PAE protected mode paging
++  cr3 = s->cr3 & 0xffffffe0;
++  v &= 0xffffffff;
++
++  // search mappings for pdp
++  for (i = 0; i < 32; i++)
++    if (kp->mem[i].used)
++      if ((cr3 >= kp->mem[i].gpaddr) &&
++	  (cr3 <= (kp->mem[i].gpaddr + kp->mem[i].size)))
++	break;
++  // not found
++  if (i == 32)
++  {
++    printf("KVM: can't find PDP in memory mappings\n");
++    run->exit_reason = KVM_EXIT_UNKNOWN;
++    run->hw.hardware_exit_reason = 47;
++    return (1);
++  }
++  cr3 = kp->mem[i].vaddr + (cr3 - kp->mem[i].gpaddr);
++  cr3 = ((u_int64_t *)(cr3))[(v >> 30) & 0x3];
++  if (!(cr3 & 1))
++  {
++    printf("KVM: PDP entry not present in memory mappings\n");
++    run->exit_reason = KVM_EXIT_UNKNOWN;
++    run->hw.hardware_exit_reason = 48;
++    return (1);
++  }
++
++  cr3 &= 0xffffff000;
++  // search mappings for pd
++  for (i = 0; i < 32; i++)
++    if (kp->mem[i].used)
++      if ((cr3 >= kp->mem[i].gpaddr) &&
++	  (cr3 <= (kp->mem[i].gpaddr + kp->mem[i].size)))
++	break;
++  // not found
++  if (i == 32)
++  {
++    printf("KVM: can't find PD in memory mappings\n");
++    run->exit_reason = KVM_EXIT_UNKNOWN;
++    run->hw.hardware_exit_reason = 49;
++    return (1);
++  }
++  cr3 = kp->mem[i].vaddr + (cr3 - kp->mem[i].gpaddr);
++  cr3 = ((u_int64_t *)(cr3))[(v >> 21) & 0x1ff];
++  if (!(cr3 & 1))
++  {
++    printf("KVM: PD entry not present in memory mappings\n");
++    run->exit_reason = KVM_EXIT_UNKNOWN;
++    run->hw.hardware_exit_reason = 50;
++    return (1);
++  }
++
++  if (cr3 & (1 << 7)) // 2MB page
++  {
++    cr3 &= 0xfffe00000;
++    v = cr3 + (v & 0x1fffff);
++  }
++  else
++  {
++    cr3 &= 0xffffff000;
++    // search mappings for pt
++    for (i = 0; i < 32; i++)
++      if (kp->mem[i].used)
++	if ((cr3 >= kp->mem[i].gpaddr) &&
++	    (cr3 <= (kp->mem[i].gpaddr + kp->mem[i].size)))
++	  break;
++    // not found
++    if (i == 32)
++    {
++      printf("KVM: can't find PT in memory mappings\n");
++      run->exit_reason = KVM_EXIT_UNKNOWN;
++      run->hw.hardware_exit_reason = 51;
++      return (1);
++    }
++    cr3 = kp->mem[i].vaddr + (cr3 - kp->mem[i].gpaddr);
++    cr3 = ((u_int64_t *)(cr3))[(v >> 12) & 0x1ff];
++    if (!(cr3 & 1))
++    {
++      printf("KVM: PAGE not present in memory mappings\n");
++      run->exit_reason = KVM_EXIT_UNKNOWN;
++      run->hw.hardware_exit_reason = 52;
++      return (1);
++    }
++	
++    cr3 &= 0xffffff000;
++    v = cr3 + (v & 0xfff);
++  }
++
++  *ret = v;
++  return (0);
++}
++
++u_int64_t kvm_guest_translate(struct kvm_p *kp, struct kvm_run *run,
++			      struct kvm_sregs *s, u_int64_t v, u_int64_t *ret)
++{
++  u_int64_t cr3;
 +  int i;
 +
 +  // if paging is enabled, we have to go through guest pml4/pde
-+  if (cr0 & (1 << 31))
-+  {    
-+    if (!(efer & (1 << 8)))
-+    {
-+      // protected mode paging
-+      printf("KVM: unhandled translation with 32bits paging\n");
-+      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = 0x2000;
-+      return (1);
-+    }
-+
-+    cr3 &= 0xfffffffffffff000;
++  if (s->cr0 & (1 << 31))
++  {
++    // protected mode paging
++    if (!(s->efer & (1 << 8)))
++      return (kvm_guest_translate_pae(kp, run, s, v, ret));
 +    
 +    // long mode paging
++    cr3 &= s->cr3 & 0xfffffffffffff000;
++
 +    // search mappings for pml4
 +    for (i = 0; i < 32; i++)
 +      if (kp->mem[i].used)
@@ -907,7 +1081,7 @@ index 0000000..c7c2d92
 +    {
 +      printf("KVM: can't find PML4 in memory mappings\n");
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = 0x2000;
++      run->hw.hardware_exit_reason = 2;
 +      return (1);
 +    }
 +    cr3 = kp->mem[i].vaddr + (cr3 - kp->mem[i].gpaddr);
@@ -916,7 +1090,7 @@ index 0000000..c7c2d92
 +    {
 +      printf("KVM: PML4 entry not present in memory mappings\n");
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = 0x2000;
++      run->hw.hardware_exit_reason = 3;
 +      return (1);
 +    }
 +    
@@ -932,7 +1106,7 @@ index 0000000..c7c2d92
 +    {
 +      printf("KVM: can't find PDP in memory mappings\n");
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = 0x2000;
++      run->hw.hardware_exit_reason = 4;
 +      return (1);
 +    }
 +    cr3 = kp->mem[i].vaddr + (cr3 - kp->mem[i].gpaddr);
@@ -941,7 +1115,7 @@ index 0000000..c7c2d92
 +    {
 +      printf("KVM: PDP entry not present in memory mappings\n");
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = 0x2000;
++      run->hw.hardware_exit_reason = 5;
 +      return (1);
 +    }
 +    
@@ -964,7 +1138,7 @@ index 0000000..c7c2d92
 +      {
 +	printf("KVM: can't find PD in memory mappings\n");
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
-+	run->hw.hardware_exit_reason = 0x2000;
++	run->hw.hardware_exit_reason = 6;
 +	return (1);
 +      }
 +      cr3 = kp->mem[i].vaddr + (cr3 - kp->mem[i].gpaddr);
@@ -973,7 +1147,7 @@ index 0000000..c7c2d92
 +      {
 +	printf("KVM: PD entry not present in memory mappings\n");
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
-+	run->hw.hardware_exit_reason = 0x2000;
++	run->hw.hardware_exit_reason = 7;
 +	return (1);
 +      }
 +
@@ -996,7 +1170,7 @@ index 0000000..c7c2d92
 +	{
 +	  printf("KVM: can't find PT in memory mappings\n");
 +	  run->exit_reason = KVM_EXIT_UNKNOWN;
-+	  run->hw.hardware_exit_reason = 0x2000;
++	  run->hw.hardware_exit_reason = 8;
 +	  return (1);
 +	}
 +	cr3 = kp->mem[i].vaddr + (cr3 - kp->mem[i].gpaddr);
@@ -1005,7 +1179,7 @@ index 0000000..c7c2d92
 +	{
 +	  printf("KVM: PAGE not present in memory mappings\n");
 +	  run->exit_reason = KVM_EXIT_UNKNOWN;
-+	  run->hw.hardware_exit_reason = 0x2000;
++	  run->hw.hardware_exit_reason = 9;
 +	  return (1);
 +	}
 +	
@@ -1061,7 +1235,7 @@ index 0000000..c7c2d92
 +    {
 +      printf("KVM: unandled register RSP in modrm16\n");
 +      kp->vcpu.kr->exit_reason = KVM_EXIT_UNKNOWN;
-+      kp->vcpu.kr->hw.hardware_exit_reason = -1;
++      kp->vcpu.kr->hw.hardware_exit_reason = 10;
 +      return (1);
 +    }
 +    break;
@@ -1285,7 +1459,7 @@ index 0000000..c7c2d92
 +      {
 +	printf("KVM: unandled register RSP in modrm\n");
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
-+	run->hw.hardware_exit_reason = -1;
++	run->hw.hardware_exit_reason = 11;
 +	return (1);
 +      }
 +      if ((prfx & PRFX_REX) || (prfx & PRFX_REXW) ||
@@ -1293,7 +1467,7 @@ index 0000000..c7c2d92
 +      {
 +	printf("KVM: unandled register RSP in modrm\n");
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
-+	run->hw.hardware_exit_reason = -1;
++	run->hw.hardware_exit_reason = 12;
 +	return (1);
 +      }
 +      else
@@ -1309,7 +1483,7 @@ index 0000000..c7c2d92
 +    {
 +      printf("KVM: unandled register RSP in modrm\n");
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = -1;
++      run->hw.hardware_exit_reason = 13;
 +      return (1);
 +    }
 +    if ((prfx & PRFX_REX) || (prfx & PRFX_REXW) ||
@@ -1317,7 +1491,7 @@ index 0000000..c7c2d92
 +    {
 +      printf("KVM: unandled register RSP in modrm\n");
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = -1;
++      run->hw.hardware_exit_reason = 14;
 +      return (1);
 +    }
 +    else
@@ -1332,7 +1506,7 @@ index 0000000..c7c2d92
 +    {
 +      printf("KVM: unandled register RSP in modrm\n");
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = -1;
++      run->hw.hardware_exit_reason = 15;
 +      return (1);
 +    }
 +    if ((prfx & PRFX_REX) || (prfx & PRFX_REXW) ||
@@ -1340,7 +1514,7 @@ index 0000000..c7c2d92
 +    {
 +      printf("KVM: unandled register RSP in modrm\n");
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = -1;
++      run->hw.hardware_exit_reason = 16;
 +      return (1);
 +    }
 +    else
@@ -1501,7 +1675,7 @@ index 0000000..c7c2d92
 +    printf("KVM: insn decoder unknown modrm @%llx [%02x]\n",
 +	   rip, *modrm);
 +    run->exit_reason = KVM_EXIT_UNKNOWN;
-+    run->hw.hardware_exit_reason = -1;
++    run->hw.hardware_exit_reason = 17;
 +    return (1);
 +  }
 +
@@ -1519,7 +1693,9 @@ index 0000000..c7c2d92
 +  u_int8_t *insn;
 +  u_int8_t insn_buf[16];
 +  u_int64_t val;
++  u_int64_t val2;
 +  int i;
++  int j;
 +
 +  kvm_hw->get_sregs(kp->hw_data, &s, kp);
 +  kvm_hw->get_regs(kp->hw_data, &r);
@@ -1530,7 +1706,7 @@ index 0000000..c7c2d92
 +    printf("KVM: trying to execute outside of guest RAM @%llx\n",
 +	   kp->vcpu.mmio.gpaddr);
 +    run->exit_reason = KVM_EXIT_UNKNOWN;
-+    run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++    run->hw.hardware_exit_reason = 18;
 +    return;
 +  }
 +  
@@ -1553,22 +1729,19 @@ index 0000000..c7c2d92
 +
 +  val = 0;
 +  // check if we need to translate guest paging
-+  if (s.cr0 & (1 << 31))
-+  {
-+    if (kvm_guest_translate(kp, run, s.cr0, s.cr3, s.efer, rip, &rip))
-+      return;
-+    // check if insn is potentially at page boundary
-+    // TODO: check guest page size
-+    // TODO: maybe make a getter for insn bytes that can check for page bound
-+    // do not enable for now
++  if (kvm_guest_translate(kp, run, &s, rip, &rip))
++    return;
++  // check if insn is potentially at page boundary
++  // TODO: check guest page size
++  // TODO: maybe make a getter for insn bytes that can check for page bound
++  // do not enable for now
 +# if 0
-+    if ((rip / PAGE_SIZE) != ((rip + 15) / PAGE_SIZE))
-+    {
-+      if (kvm_guest_translate(kp, run, s.cr0, s.cr3, s.efer, rip + 15, &val))
-+	return;
-+    }
-+#endif
++  if ((rip / PAGE_SIZE) != ((rip + 15) / PAGE_SIZE))
++  {
++    if (kvm_guest_translate(kp, run, &s, rip + 15, &val))
++      return;
 +  }
++#endif
 +
 +  // search mappings
 +  for (i = 0; i < 32; i++)
@@ -1582,7 +1755,7 @@ index 0000000..c7c2d92
 +  {
 +    printf("KVM: can't find RIP in memory mappings\n");
 +    run->exit_reason = KVM_EXIT_UNKNOWN;
-+    run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++    run->hw.hardware_exit_reason = 19;
 +    return;
 +  }
 +
@@ -1604,7 +1777,7 @@ index 0000000..c7c2d92
 +    {
 +      printf("KVM: can't find RIP + 15 in memory mappings\n");
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++      run->hw.hardware_exit_reason = 20;
 +      return;
 +    }
 +
@@ -1778,6 +1951,8 @@ index 0000000..c7c2d92
 +
 +  if (prfx & PRFX_REXW)
 +    kp->vcpu.mmio.size = op_size = 8;
++
++  kp->vcpu.mmio.flag = KVM_MMIO_MOV;
 +  
 +  switch (*insn)
 +  {
@@ -1787,11 +1962,11 @@ index 0000000..c7c2d92
 +      printf("KVM: opcode @%llx [%02x] is a read, exit is a write\n",
 +	     rip, *insn);
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++      run->hw.hardware_exit_reason = 21;
 +      return;
 +    }
 +    kp->vcpu.insn_len = 2;
-+    kp->vcpu.mmio.flag = 16;
++    kp->vcpu.mmio.flag = KVM_MMIO_OR;
 +    op_size = kp->vcpu.mmio.size = 1;
 +    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, addr_size, op_size,s.cr0))
 +      return;
@@ -1808,7 +1983,7 @@ index 0000000..c7c2d92
 +	printf("KVM: opcode @%llx [0f%02x] is a read, exit is a write\n",
 +	       rip, insn[1]);
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
-+	run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++	run->hw.hardware_exit_reason = 22;
 +	return;
 +      }
 +      kp->vcpu.insn_len = 3;
@@ -1824,7 +1999,7 @@ index 0000000..c7c2d92
 +	     "after extension 0f [%02x]\n",
 +	     rip, insn[1]);
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++      run->hw.hardware_exit_reason = 23;
 +      return;
 +    }
 +    break;
@@ -1835,11 +2010,11 @@ index 0000000..c7c2d92
 +      printf("KVM: opcode @%llx [%02x] is a read, exit is a write\n",
 +	     rip, *insn);
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++      run->hw.hardware_exit_reason = 24;
 +      return;
 +    }
 +    kp->vcpu.insn_len = 2;
-+    kp->vcpu.mmio.flag = 4;
++    kp->vcpu.mmio.flag = KVM_MMIO_AND;
 +    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, addr_size, op_size,s.cr0))
 +      return;
 +    break;
@@ -1850,21 +2025,21 @@ index 0000000..c7c2d92
 +      printf("KVM: opcode @%llx [%02x] is a read, exit is a write\n",
 +	     rip, *insn);
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++      run->hw.hardware_exit_reason = 25;
 +      return;
 +    }
 +    switch ((insn[1] >> 3) & 0x7)
 +    {
 +    case 7: // CMP [R], IMM32
 +      kp->vcpu.insn_len = 2 + op_size;
-+      kp->vcpu.mmio.flag = 8;
++      kp->vcpu.mmio.flag = KVM_MMIO_CMP;
 +      kp->vcpu.mmio.ptr = (void *)(insn + 2);
 +      break;
 +    default:
 +      printf("KVM: insn decoder unknown opcode @%llx [%02x%02x]\n",
 +	     rip, *insn, insn[1]);
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++      run->hw.hardware_exit_reason = 26;
 +      return;
 +    }
 +    break;
@@ -1875,7 +2050,7 @@ index 0000000..c7c2d92
 +      printf("KVM: opcode @%llx [%02x] is a write, exit is a read\n",
 +	     rip, *insn);
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++      run->hw.hardware_exit_reason = 27;
 +      return;
 +    }
 +    kp->vcpu.insn_len = 2;
@@ -1890,7 +2065,7 @@ index 0000000..c7c2d92
 +      printf("KVM: opcode @%llx [%02x] is a write, exit is a read\n",
 +	     rip, *insn);
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++      run->hw.hardware_exit_reason = 28;
 +      return;
 +    }
 +    kp->vcpu.insn_len = 2;
@@ -1904,7 +2079,7 @@ index 0000000..c7c2d92
 +      printf("KVM: opcode @%llx [%02x] is a read, exit is a write\n",
 +	     rip, *insn);
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++      run->hw.hardware_exit_reason = 29;
 +      return;
 +    }
 +    kp->vcpu.insn_len = 2;
@@ -1919,7 +2094,7 @@ index 0000000..c7c2d92
 +      printf("KVM: opcode @%llx [%02x] is a read, exit is a write\n",
 +	     rip, *insn);
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++      run->hw.hardware_exit_reason = 30;
 +      return;
 +    }
 +    kp->vcpu.insn_len = 2;
@@ -1933,7 +2108,7 @@ index 0000000..c7c2d92
 +      printf("KVM: opcode @%llx [%02x] is a read, exit is a write\n",
 +	     rip, *insn);
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++      run->hw.hardware_exit_reason = 31;
 +      return;
 +    }
 +    //    kp->vcpu.mmio.size = 4;
@@ -1947,7 +2122,7 @@ index 0000000..c7c2d92
 +      printf("KVM: opcode @%llx [%02x] is a write, exit is a read\n",
 +	     rip, *insn);
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++      run->hw.hardware_exit_reason = 32;
 +      return;
 +    }
 +    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
@@ -1955,41 +2130,67 @@ index 0000000..c7c2d92
 +    break;
 +    
 +  case 0xa4: // MOVSB
++    kp->vcpu.mmio.size = 1;
 +  case 0xa5: // MOVSL
-+    if (kp->vcpu.mmio.dir)
-+      val = s.ds.base + (r.rsi & ((addr_size == 2) ? 0xffff : 0xffffffff));
-+    else
-+      val = s.es.base + (r.rdi & ((addr_size == 2) ? 0xffff : 0xffffffff));
++    val = s.ds.base + (r.rsi & ((addr_size == 2) ? 0xffff : 0xffffffff));
++    val2 = s.es.base + (r.rdi & ((addr_size == 2) ? 0xffff : 0xffffffff));
++    if (kvm_guest_translate(kp, run, &s, val, &val))
++      return;
++    if (kvm_guest_translate(kp, run, &s, val2, &val2))
++      return;    
 +    // search mappings
 +    for (i = 0; i < 32; i++)
 +      if (kp->mem[i].used)
 +	if ((val >= kp->mem[i].gpaddr) &&
 +	    (val <= (kp->mem[i].gpaddr + kp->mem[i].size)))
 +	  break;
-+    // not found
-+    if (i == 32)
++    for (j = 0; j < 32; j++)
++      if (kp->mem[j].used)
++	if ((val2 >= kp->mem[j].gpaddr) &&
++	    (val2 <= (kp->mem[j].gpaddr + kp->mem[j].size)))
++	  break;
++    // MMIO to MMIO
++    if ((i == 32) && (j == 32))
 +    {
 +      if (kp->vcpu.mmio.dir)
 +      {
 +	printf("KVM: exit is a write during MMIO to MMIO MOVS copy\n");
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
-+	run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++	run->hw.hardware_exit_reason = 33;
 +	return;
 +      }
 +      // MMIO to MMIO copy
-+      kp->vcpu.mmio.flag = 2; // signal we have to write the read value back
-+      kp->vcpu.mmio.ptr2 = val;
++      kp->vcpu.mmio.flag = KVM_MMIO_TO_MMIO;
++      kp->vcpu.mmio.ptr2 = val2;
 +    }
-+    else
++    // MMIO read
++    else if (i == 32)
 +    {
++      if (kp->vcpu.mmio.dir)
++      {
++	printf("KVM: exit is a write insn is a read\n");
++	run->exit_reason = KVM_EXIT_UNKNOWN;
++	run->hw.hardware_exit_reason = 53;
++	return;
++      }
++      kp->vcpu.mmio.ptr = (void *)(kp->mem[j].vaddr +
++				   (val2 - kp->mem[j].gpaddr));
++      kp->vcpu.mmio.flag = KVM_MMIO_MOV;
++    }
++    // MMIO write
++    else if (j == 32)
++    {
++      if (!kp->vcpu.mmio.dir)
++      {
++	printf("KVM: exit is a read insn is a write\n");
++	run->exit_reason = KVM_EXIT_UNKNOWN;
++	run->hw.hardware_exit_reason = 54;
++	return;
++      }
 +      kp->vcpu.mmio.ptr = (void *)(kp->mem[i].vaddr +
 +				   (val - kp->mem[i].gpaddr));
-+      kp->vcpu.mmio.flag = 0;
++      kp->vcpu.mmio.flag = KVM_MMIO_MOV;
 +    }
-+    if (*insn == 0xa4)
-+      kp->vcpu.mmio.size = 1;
-+    //    else
-+    //      kp->vcpu.mmio.size = 4;
 +    // increment or decrement esi edi
 +    if (r.rflags & (1 << 10))
 +    {
@@ -2011,7 +2212,7 @@ index 0000000..c7c2d92
 +      printf("KVM: opcode @%llx [%02x] is a write, exit is a read\n",
 +	     rip, *insn);
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++      run->hw.hardware_exit_reason = 34;
 +      return;
 +    }
 +    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
@@ -2032,7 +2233,7 @@ index 0000000..c7c2d92
 +      printf("KVM: opcode @%llx [%02x] is a write, exit is a read\n",
 +	     rip, *insn);
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++      run->hw.hardware_exit_reason = 35;
 +      return;
 +    }
 +    kp->vcpu.insn_len = 2 + kp->vcpu.mmio.size;
@@ -2046,7 +2247,7 @@ index 0000000..c7c2d92
 +    printf("KVM: insn decoder unknown opcode @%llx [%02x]\n",
 +	   rip, *insn);
 +    run->exit_reason = KVM_EXIT_UNKNOWN;
-+    run->hw.hardware_exit_reason = KVM_EXIT_MMIO;
++    run->hw.hardware_exit_reason = 36;
 +    return;
 +  }
 +
@@ -2084,7 +2285,7 @@ index 0000000..c7c2d92
 +    kvm_hw->set_regs(kp->hw_data, &r);
 +  }
 +
-+  kp->vcpu.mmio.flag |= 1;
++  kp->vcpu.mmio.flag |= KVM_MMIO_EN;
 +  run->exit_reason = KVM_EXIT_MMIO;
 +  run->mmio.phys_addr = kp->vcpu.mmio.gpaddr;
 +  run->mmio.len = kp->vcpu.mmio.size;
@@ -2138,7 +2339,7 @@ index 0000000..c7c2d92
 +    {
 +      printf("KVM: unhandled rep I/O operation on non-string opcode\n");
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_IO;
++      run->hw.hardware_exit_reason = 37;
 +      return;
 +    }
 +  }
@@ -2176,7 +2377,7 @@ index 0000000..c7c2d92
 +      default:
 +	printf("KVM: unhandled I/O addr size %x\n", kp->vcpu.io.addr_size);
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
-+	run->hw.hardware_exit_reason = KVM_EXIT_IO;
++	run->hw.hardware_exit_reason = 38;
 +	return;
 +      }
 +    }
@@ -2206,7 +2407,7 @@ index 0000000..c7c2d92
 +      default:
 +	printf("KVM: unhandled segment %x\n", kp->vcpu.io.seg);
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
-+	run->hw.hardware_exit_reason = KVM_EXIT_IO;
++	run->hw.hardware_exit_reason = 39;
 +	return;
 +      }
 +      
@@ -2225,7 +2426,7 @@ index 0000000..c7c2d92
 +      default:
 +	printf("KVM: unhandled I/O addr size %x\n", kp->vcpu.io.addr_size);
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
-+	run->hw.hardware_exit_reason = KVM_EXIT_IO;
++	run->hw.hardware_exit_reason = 40;
 +	return;
 +      }
 +    }
@@ -2234,9 +2435,8 @@ index 0000000..c7c2d92
 +    val += off;
 +    
 +    // check if we need to translate with guest page tables
-+    if (s.cr0 & (1 << 31))
-+      if (kvm_guest_translate(kp, run, s.cr0, s.cr3, s.efer, val, &val))
-+	return;
++    if (kvm_guest_translate(kp, run, &s, val, &val))
++      return;
 +
 +    // search the address in our memory mappings
 +    for (i = 0; i < 32; i++)
@@ -2250,7 +2450,7 @@ index 0000000..c7c2d92
 +    {
 +      printf("KVM: ptr to I/O string operation not in mappings\n");
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_IO;
++      run->hw.hardware_exit_reason = 41;
 +      return;
 +    }
 +    
@@ -2260,7 +2460,7 @@ index 0000000..c7c2d92
 +    {
 +      printf("KVM: I/O string operation would overflow memory mapping\n");
 +      run->exit_reason = KVM_EXIT_UNKNOWN;
-+      run->hw.hardware_exit_reason = KVM_EXIT_IO;
++      run->hw.hardware_exit_reason = 42;
 +      return;
 +    }
 +    
@@ -2294,7 +2494,7 @@ index 0000000..c7c2d92
 +	// size unhandled
 +	printf("KVM: I/O op size not handled (%lld)\n", kp->vcpu.io.size);
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
-+	run->hw.hardware_exit_reason = KVM_EXIT_IO;
++	run->hw.hardware_exit_reason = 43;
 +	break;
 +      }
 +}
@@ -2348,6 +2548,7 @@ index 0000000..c7c2d92
 +int kvm_handle_pre_mmio(struct kvm_run *run, struct kvm_p *kp)
 +{
 +  struct kvm_regs r;
++  u_int32_t flags;
 +
 +  if (kp->vcpu.mmio.dir == 0)
 +  {
@@ -2356,118 +2557,170 @@ index 0000000..c7c2d92
 +      printf("KVM: ERR userland did not fulfill MMIO access\n");
 +      return (-ENXIO);
 +    }
-+    if (kp->vcpu.mmio.flag & 2)
++    if (kp->vcpu.mmio.flag & KVM_MMIO_TO_MMIO)
 +    {
 +      run->mmio.phys_addr = kp->vcpu.mmio.ptr2;
 +      run->mmio.len = kp->vcpu.mmio.size;
 +      run->mmio.is_write = 1;
 +      kp->vcpu.mmio.dir = 1;
-+      kp->vcpu.mmio.flag = 1;
++      kp->vcpu.mmio.flag = KVM_MMIO_MOV | KVM_MMIO_EN;
 +      run->exit_reason = KVM_EXIT_MMIO;
 +      return (0);
 +    }
-+    switch (kp->vcpu.mmio.size)
++    switch (kp->vcpu.mmio.flag)
 +    {
-+    case 1:
-+      if (kp->vcpu.mmio.flag & 4)
-+	*(u_int8_t *)(kp->vcpu.mmio.ptr) &= *(u_int8_t *)(&(run->mmio.data));
-+      else
-+	if (kp->vcpu.mmio.flag & 8)
-+	{
-+	  kvm_hw->get_regs(kp->hw_data, &r);
-+	  if (*(u_int8_t *)(kp->vcpu.mmio.ptr) ==
-+	      *(u_int8_t *)(&(run->mmio.data)))
-+	    r.rflags |= 0x40; // ZF
-+	  else
-+	    r.rflags &= ~0x40; // !ZF
-+	  kvm_hw->set_regs(kp->hw_data, &r);
-+	}
-+	else
-+	  if (kp->vcpu.mmio.flag & 16)
-+	    *(u_int8_t *)(kp->vcpu.mmio.ptr) |=
-+	      *(u_int8_t *)(&(run->mmio.data));
-+	  else
-+	    *(u_int8_t *)(kp->vcpu.mmio.ptr) =
-+	      *(u_int8_t *)(&(run->mmio.data));
++    case KVM_MMIO_EN | KVM_MMIO_AND: // AND
++      kvm_hw->get_regs(kp->hw_data, &r);
++      switch (kp->vcpu.mmio.size)
++      {
++      case 1:
++	asm volatile("mov (%%rbx), %%dl;"
++		     "and %%dl, (%%rax);"
++		     "lahf;" :
++		     "=a"(flags) :
++		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "rdx");
++	break;
++      case 2:
++	asm volatile("mov (%%rbx), %%dx;"
++		     "and %%dx, (%%rax);"
++		     "lahf;" :
++		     "=a"(flags) :
++		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "rdx");
++	break;
++      case 4:
++	asm volatile("mov (%%rbx), %%edx;"
++		     "and %%edx, (%%rax);"
++		     "lahf;" :
++		     "=a"(flags) :
++		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "rdx");
++	break;
++      case 8:
++	asm volatile("mov (%%rbx), %%rdx;"
++		     "and %%rdx, (%%rax);"
++		     "lahf;" :
++		     "=a"(flags) :
++		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "rdx");
++	break;
++      }
++      r.rflags &= ~KVM_FLAGS_MASK;
++      r.rflags &= (flags & KVM_FLAGS_MASK);
++      kvm_hw->set_regs(kp->hw_data, &r);
 +      break;
-+    case 2:
-+      if (kp->vcpu.mmio.flag & 4)
-+	*(u_int16_t *)(kp->vcpu.mmio.ptr) &=
-+	  *(u_int16_t *)(&(run->mmio.data));
-+      else
-+	if (kp->vcpu.mmio.flag & 8)
-+	{
-+	  kvm_hw->get_regs(kp->hw_data, &r);
-+	  if (*(u_int16_t *)(kp->vcpu.mmio.ptr) ==
-+	      *(u_int16_t *)(&(run->mmio.data)))
-+	    r.rflags |= 0x40; // ZF
-+	  else
-+	    r.rflags &= ~0x40; // !ZF
-+	  kvm_hw->set_regs(kp->hw_data, &r);
-+	}
-+      	else
-+	  if (kp->vcpu.mmio.flag & 16)
-+	    *(u_int16_t *)(kp->vcpu.mmio.ptr) |=
-+	      *(u_int16_t *)(&(run->mmio.data));
-+	  else
-+	    *(u_int16_t *)(kp->vcpu.mmio.ptr) =
-+	      *(u_int16_t *)(&(run->mmio.data));
++      
++    case KVM_MMIO_EN | KVM_MMIO_CMP: // CMP
++      kvm_hw->get_regs(kp->hw_data, &r);
++      switch (kp->vcpu.mmio.size)
++      {
++      case 1:
++	asm volatile("mov (%%rbx), %%dl;"
++		     "cmp %%dl, (%%rax);"
++		     "lahf;" :
++		     "=a"(flags) :
++		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "rdx");
++	break;
++      case 2:
++	asm volatile("mov (%%rbx), %%dx;"
++		     "cmp %%dx, (%%rax);"
++		     "lahf;" :
++		     "=a"(flags) :
++		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "rdx");
++	break;
++      case 4:
++	asm volatile("mov (%%rbx), %%edx;"
++		     "cmp %%edx, (%%rax);"
++		     "lahf;" :
++		     "=a"(flags) :
++		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "rdx");
++	break;
++      case 8:
++	asm volatile("mov (%%rbx), %%rdx;"
++		     "cmp %%rdx, (%%rax);"
++		     "lahf;" :
++		     "=a"(flags) :
++		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "rdx");
++	break;
++      }
++      r.rflags &= ~KVM_FLAGS_MASK;
++      r.rflags &= (flags & KVM_FLAGS_MASK);
++      kvm_hw->set_regs(kp->hw_data, &r);
 +      break;
-+    case 4:
-+      if (kp->vcpu.mmio.flag & 4)
-+	*(u_int32_t *)(kp->vcpu.mmio.ptr) &=
-+	  *(u_int32_t *)(&(run->mmio.data));
-+      else
-+	if (kp->vcpu.mmio.flag & 8)
-+	{
-+	  kvm_hw->get_regs(kp->hw_data, &r);
-+	  if (*(u_int32_t *)(kp->vcpu.mmio.ptr) ==
-+	      *(u_int32_t *)(&(run->mmio.data)))
-+	    r.rflags |= 0x40; // ZF
-+	  else
-+	    r.rflags &= ~0x40; // !ZF
-+	  kvm_hw->set_regs(kp->hw_data, &r);
-+	}
-+      	else
-+	  if (kp->vcpu.mmio.flag & 16)
-+	    *(u_int32_t *)(kp->vcpu.mmio.ptr) |=
-+	      *(u_int32_t *)(&(run->mmio.data));
-+	  else
-+	    *(u_int32_t *)(kp->vcpu.mmio.ptr) =
-+	      *(u_int32_t *)(&(run->mmio.data));
++      
++    case KVM_MMIO_EN | KVM_MMIO_OR: // OR
++      kvm_hw->get_regs(kp->hw_data, &r);
++      switch (kp->vcpu.mmio.size)
++      {
++      case 1:
++	asm volatile("mov (%%rbx), %%dl;"
++		     "or %%dl, (%%rax);"
++		     "lahf;" :
++		     "=a"(flags) :
++		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "rdx");
++	break;
++      case 2:
++	asm volatile("mov (%%rbx), %%dx;"
++		     "or %%dx, (%%rax);"
++		     "lahf;" :
++		     "=a"(flags) :
++		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "rdx");
++	break;
++      case 4:
++	asm volatile("mov (%%rbx), %%edx;"
++		     "or %%edx, (%%rax);"
++		     "lahf;" :
++		     "=a"(flags) :
++		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "rdx");
++	break;
++      case 8:
++	asm volatile("mov (%%rbx), %%rdx;"
++		     "or %%rdx, (%%rax);"
++		     "lahf;" :
++		     "=a"(flags) :
++		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "rdx");
++	break;
++      }
++      r.rflags &= ~KVM_FLAGS_MASK;
++      r.rflags &= (flags & KVM_FLAGS_MASK);
++      kvm_hw->set_regs(kp->hw_data, &r);
 +      break;
-+    case 8:
-+      if (kp->vcpu.mmio.flag & 4)
-+	*(u_int64_t *)(kp->vcpu.mmio.ptr) &=
-+	  *(u_int64_t *)(&(run->mmio.data));
-+      else
-+	if (kp->vcpu.mmio.flag & 8)
-+	{
-+	  kvm_hw->get_regs(kp->hw_data, &r);
-+	  if (*(u_int64_t *)(kp->vcpu.mmio.ptr) ==
-+	      *(u_int64_t *)(&(run->mmio.data)))
-+	    r.rflags |= 0x40; // ZF
-+	  else
-+	    r.rflags &= ~0x40; // !ZF
-+	  kvm_hw->set_regs(kp->hw_data, &r);
-+	}
-+      	else
-+	  if (kp->vcpu.mmio.flag & 16)
-+	    *(u_int64_t *)(kp->vcpu.mmio.ptr) |=
-+	      *(u_int64_t *)(&(run->mmio.data));
-+	  else
-+	    *(u_int64_t *)(kp->vcpu.mmio.ptr) =
-+	      *(u_int64_t *)(&(run->mmio.data));
++      
++    case KVM_MMIO_EN | KVM_MMIO_MOV: // MOV
++      switch (kp->vcpu.mmio.size)
++      {
++      case 1:
++	*(u_int8_t *)(kp->vcpu.mmio.ptr) = *(u_int8_t *)(&(run->mmio.data));
++	break;
++      case 2:
++	*(u_int16_t *)(kp->vcpu.mmio.ptr) = *(u_int16_t *)(&(run->mmio.data));
++	break;
++      case 4:
++	*(u_int32_t *)(kp->vcpu.mmio.ptr) = *(u_int32_t *)(&(run->mmio.data));
++	break;
++      case 8:
++	*(u_int64_t *)(kp->vcpu.mmio.ptr) = *(u_int64_t *)(&(run->mmio.data));
++	break;
++      }
 +      break;
 +    }
 +  }
 +  else
-+    if (kp->vcpu.mmio.flag & 2)
++    if (kp->vcpu.mmio.flag & KVM_MMIO_TO_MMIO)
 +    {
 +      printf("KVM: ERR userland did not fulfill MMIO MOVSB access\n");
 +      return (-ENXIO);
 +    }
-+  kp->vcpu.mmio.flag = 0;
++  kp->vcpu.mmio.flag = KVM_MMIO_MOV;
 +  
 +  return (0);
 +}
@@ -2561,12 +2814,12 @@ index 0000000..c7c2d92
 +      return (0);
 +    case KVM_RUN:
 +      // handle MMIO access from userland
-+      if (kp->vcpu.mmio.flag & 1)
++      if (kp->vcpu.mmio.flag & KVM_MMIO_EN)
 +      {
 +	if ((ret = kvm_handle_pre_mmio(kp->vcpu.kr, kp)))
 +	  return (ret);
 +	// MMIO to MMIO
-+	if (kp->vcpu.mmio.flag & 1)
++	if (kp->vcpu.mmio.flag & KVM_MMIO_EN)
 +	  return (0);
 +      }
 +      // handle IO operation from userland
@@ -5578,10 +5831,10 @@ index 809766a..e28f075 100644
  #define CPUF_BSP	0x0001		/* CPU is the original BSP */
 diff --git a/sys/arch/amd64/include/kvm.h b/sys/arch/amd64/include/kvm.h
 new file mode 100644
-index 0000000..42a966a
+index 0000000..858efcd
 --- /dev/null
 +++ b/sys/arch/amd64/include/kvm.h
-@@ -0,0 +1,1032 @@
+@@ -0,0 +1,1041 @@
 +#ifndef _MACHINE_KVM_H_
 +#define _MACHINE_KVM_H_
 +
@@ -5610,6 +5863,15 @@ index 0000000..42a966a
 +#define KVM_REG_R13 12
 +#define KVM_REG_R14 13
 +#define KVM_REG_R15 14
++
++#define KVM_MMIO_MOV 0
++#define KVM_MMIO_EN 1
++#define KVM_MMIO_TO_MMIO 2
++#define KVM_MMIO_AND 4
++#define KVM_MMIO_CMP 8
++#define KVM_MMIO_OR 16
++
++#define KVM_FLAGS_MASK 0b100011010101
 +
 +struct v_mmio
 +{
