@@ -84,7 +84,7 @@ index c1dedf9..f9bccc0 100644
  }
 diff --git a/sys/arch/amd64/amd64/kvm.c b/sys/arch/amd64/amd64/kvm.c
 new file mode 100644
-index 0000000..f169fe3
+index 0000000..1506daa
 --- /dev/null
 +++ b/sys/arch/amd64/amd64/kvm.c
 @@ -0,0 +1,2763 @@
@@ -1068,7 +1068,7 @@ index 0000000..f169fe3
 +      return (kvm_guest_translate_pae(kp, run, s, v, ret));
 +    
 +    // long mode paging
-+    cr3 &= s->cr3 & 0xfffffffffffff000;
++    cr3 = s->cr3 & 0xfffffffffffff000;
 +
 +    // search mappings for pml4
 +    for (i = 0; i < 32; i++)
