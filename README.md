@@ -21,7 +21,7 @@ Known caveats:
  - only one vCPU supported
  - quick and dirty code :D
  - the IO/MMIO instruction emulation is, at best, a hack
- - sometimes to install debian on intel CPU, it is needed to kill a modprobe btrfs process
+ - ~~sometimes to install debian on intel CPU, it is needed to kill a modprobe btrfs process~~ fixed by disabling AVX for guests until we support xsave/xrstor
  - ~~text and VGA console doesn't refresh well, the culprit would be, IO/MMIO emulation and/or the KVM_GET_DIRTY_LOG ioctl~~ fixed with dirty log patch
  - ...
 

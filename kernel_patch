@@ -84,7 +84,7 @@ index c1dedf9..f9bccc0 100644
  }
 diff --git a/sys/arch/amd64/amd64/kvm.c b/sys/arch/amd64/amd64/kvm.c
 new file mode 100644
-index 0000000..9c26596
+index 0000000..38ddd42
 --- /dev/null
 +++ b/sys/arch/amd64/amd64/kvm.c
 @@ -0,0 +1,2743 @@
@@ -622,7 +622,7 @@ index 0000000..9c26596
 +  c->entries[1].flags = 0;
 +  CPUID(1, c->entries[1].eax, c->entries[1].ebx, c->entries[1].ecx, c->entries[1].edx);
 +  c->entries[1].ebx &= 0x00ffffff;
-+  c->entries[1].ecx &= 0x72da3203;
++  c->entries[1].ecx &= 0x62da3203;
 +  c->entries[1].edx &= 0x0f8bfbff;
 +  // EAX = 7, ECX = 0
 +  c->entries[2].function = 7;
