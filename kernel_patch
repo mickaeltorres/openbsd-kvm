@@ -84,10 +84,10 @@ index c1dedf9..f9bccc0 100644
  }
 diff --git a/sys/arch/amd64/amd64/kvm.c b/sys/arch/amd64/amd64/kvm.c
 new file mode 100644
-index 0000000..17bee93
+index 0000000..66c9696
 --- /dev/null
 +++ b/sys/arch/amd64/amd64/kvm.c
-@@ -0,0 +1,2805 @@
+@@ -0,0 +1,2825 @@
 +/*
 + * Copyright (c) 2016 Mickael Torres
 + * All rights reserved.
@@ -166,13 +166,6 @@ index 0000000..17bee93
 +    if (!p->p_p->ps_mainproc->p_kvm)
 +      return (ENOMEM);
 +    bzero(p->p_p->ps_mainproc->p_kvm, sizeof(struct kvm_p));
-+    p->p_p->ps_mainproc->p_kvm->hw_data = kvm_hw->init(p);
-+    if (!p->p_p->ps_mainproc->p_kvm->hw_data)
-+    {
-+      free(p->p_p->ps_mainproc->p_kvm, M_MEMDESC, sizeof(struct kvm_p));
-+      p->p_p->ps_mainproc->p_kvm = NULL;
-+      return (ENXIO);
-+    }
 +    SLIST_INIT(&p->p_p->ps_mainproc->p_kvm->vp);
 +    // allocate the PML4 for nested paging
 +    p->p_p->ps_mainproc->p_kvm->vpml4 = uvm_km_zalloc(kernel_map, PAGE_SIZE);
@@ -187,7 +180,6 @@ index 0000000..17bee93
 +    return (0);
 +    
 +  case 1: // /dev/kvm_vm
-+    //    printf("KVM: open vm\n");
 +    if (!p->p_p->ps_mainproc->p_kvm)
 +      return (EBADF);
 +    if (p->p_p->ps_mainproc->p_kvm->created)
@@ -195,11 +187,19 @@ index 0000000..17bee93
 +    return (0);
 +    
 +  case 2: // /dev/kvm_vcpu
-+    //    printf("KVM: open cpu\n");
 +    if (!p->p_p->ps_mainproc->p_kvm || !p->p_p->ps_mainproc->p_kvm->created)
 +      return (EBADF);
-+    if (p->p_p->ps_mainproc->p_kvm->vcpu.created)
++    if (p->p_kvm_vcpu)
 +      return (EBUSY);
++    if (p->p_p->ps_mainproc->p_kvm->vcpu_count >= 16)
++      return (EBUSY);
++    p->p_kvm_vcpu = malloc(sizeof(struct kvm_vcpu), M_MEMDESC, M_WAITOK);
++    if (!p->p_kvm_vcpu)
++      return (ENOMEM);
++    p->p_kvm_vcpu->hw_data = kvm_hw->init(p);
++    p->p_p->ps_mainproc->p_kvm->vcpu[p->p_p->ps_mainproc->p_kvm->vcpu_count]=
++      p->p_kvm_vcpu;
++    p->p_p->ps_mainproc->p_kvm->vcpu_count++;
 +    return (0);
 +    
 +  default:
@@ -218,29 +218,29 @@ index 0000000..17bee93
 +  switch (minor(dev))
 +  {
 +  case 0: // /dev/kvm
-+  case 1: // /dev/kvm_vm
-+  case 2: // /dev/kvm_vcpu
-+    //    printf("KVM: close system\n");
 +    if (kp)
 +    {
++      kp->shutdown = 1;
++      preempt(NULL);
 +      for (i = 0; i < 32; i++)
 +	if (kp->mem[i].used)
 +	{
 +	  // unmap region
 +	  kvm_map_range(p, kp, kp->mem[i].gpaddr, 0, kp->mem[i].size, 1, 0);
-+	  // free kernel vspace
-+	  //	  km_free((void *)kp->mem[i].vaddr, kp->mem[i].size,
-+	  //		  &kv_any, &kp_none);
-+	  //	  uvm_unmap(kernel_map, kp->mem[i].vaddr,
-+	  //		    kp->mem[i].vaddr + kp->mem[i].size);
 +	  kp->mem[i].vaddr = 0;
 +	}
-+      kvm_hw->free(kp->hw_data);
-+      if (kp->vcpu.kr)
-+      {
-+	km_free(kp->vcpu.kr, PAGE_SIZE, &kv_any, &kp_zero);
-+	kp->vcpu.kr = 0;
-+      }
++      for (i = 0; i < kp->vcpu_count; i++)
++	if (kp->vcpu[i])
++	{
++	  kvm_hw->free(kp->vcpu[i]->hw_data);
++	  if (kp->vcpu[i]->kr)
++	  {
++	    km_free(kp->vcpu[i]->kr, PAGE_SIZE, &kv_any, &kp_zero);
++	    kp->vcpu[i]->kr = 0;
++	  }
++	  free(kp->vcpu[i], M_MEMDESC, sizeof(struct kvm_vcpu));
++	  kp->vcpu[i] = NULL;
++	}
 +      while (!SLIST_EMPTY(&kp->vp))
 +      {
 +	v = SLIST_FIRST(&kp->vp);
@@ -252,6 +252,10 @@ index 0000000..17bee93
 +      p->p_p->ps_mainproc->p_kvm = NULL;
 +    }
 +    return (0);
++  case 1: // /dev/kvm_vm
++  case 2: // /dev/kvm_vcpu
++    return (0);
++
 +  default:
 +    return (ENODEV);
 +  }
@@ -268,11 +272,10 @@ index 0000000..17bee93
 +  {
 +  case 2: // /dev/kvm_vcpu
 +    if (!offset &&
-+	(p->p_p->ps_mainproc->p_kvm) &&
-+	(p->p_p->ps_mainproc->p_kvm->vcpu.kr))
++	(p->p_kvm_vcpu) &&
++	(p->p_kvm_vcpu->kr))
 +    {
-+      pmap_extract(pmap_kernel(), (vaddr_t)p->p_p->ps_mainproc->p_kvm->vcpu.kr,
-+		   &pa);
++      pmap_extract(pmap_kernel(), (vaddr_t)p->p_kvm_vcpu->kr, &pa);
 +      return ((void *)pa);
 +    }
 +    return (MAP_FAILED);
@@ -561,7 +564,9 @@ index 0000000..17bee93
 +  case KVM_CAP_NR_MEMSLOTS:
 +    return (32);
 +  case KVM_CAP_NR_VCPUS:
++    return (ncpus);
 +  case KVM_CAP_MAX_VCPUS:
++    return (16);
 +  case KVM_CAP_USER_MEMORY:
 +  case KVM_CAP_DESTROY_MEMORY_REGION_WORKS:
 +  case KVM_CAP_SET_TSS_ADDR:
@@ -685,7 +690,7 @@ index 0000000..17bee93
 +  int err;
 +  int fd;
 +
-+  if (p->p_p->ps_mainproc->p_kvm->vcpu.created)
++  if (p->p_kvm_vcpu)
 +    return (-EBUSY);
 +  fdplock(fdp);
 +  if ((err = falloc(p, &fp, &fd)) != 0)
@@ -701,13 +706,11 @@ index 0000000..17bee93
 +    fdpunlock(fdp);
 +    return (-err);
 +  }
-+  p->p_p->ps_mainproc->p_kvm->vcpu.kr = km_alloc(PAGE_SIZE, &kv_any, &kp_zero,
-+						 &kd_waitok);
-+  if (!p->p_p->ps_mainproc->p_kvm->vcpu.kr)
++  p->p_kvm_vcpu->kr = km_alloc(PAGE_SIZE, &kv_any, &kp_zero, &kd_waitok);
++  if (!p->p_kvm_vcpu->kr)
 +    return (-ENOMEM);
-+  p->p_p->ps_mainproc->p_kvm->vcpu.created = 1;
-+  p->p_p->ps_mainproc->p_kvm->vcpu.lapic = KVM_DEFAULT_LAPIC_BASE |
-+    KVM_LAPIC_EN | KVM_LAPIC_BSP;
++  p->p_kvm_vcpu->lapic = KVM_DEFAULT_LAPIC_BASE | KVM_LAPIC_EN |
++    (p->p_p->ps_mainproc->p_kvm->vcpu_count == 1 ? KVM_LAPIC_BSP : 0);
 +  fp->f_type = DTYPE_VNODE;
 +  fp->f_ops = &vnops;
 +  fp->f_data = nd.ni_vp;
@@ -1195,6 +1198,8 @@ index 0000000..17bee93
 +
 +int kvm_emul_modrm16(struct kvm_p *kp, u_int8_t *modrm, u_int32_t op_size)
 +{
++  struct kvm_vcpu *vcpu = curproc->p_kvm_vcpu;
++  
 +  // set register
 +  switch (*modrm)
 +  {
@@ -1202,28 +1207,28 @@ index 0000000..17bee93
 +  case 0x40 ... 0x47:
 +  case 0x80 ... 0x87:
 +  case 0xc0 ... 0xc7:
-+    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
++    vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RAX);
 +    break;
 +
 +  case 0x08 ... 0x0f:
 +  case 0x48 ... 0x4f:
 +  case 0x88 ... 0x8f:
 +  case 0xc8 ... 0xcf:
-+    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RCX);
++    vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RCX);
 +    break;
 +
 +  case 0x10 ... 0x17:
 +  case 0x50 ... 0x57:
 +  case 0x90 ... 0x97:
 +  case 0xd0 ... 0xd7:
-+    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDX);
++    vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RDX);
 +    break;
 +
 +  case 0x18 ... 0x1f:
 +  case 0x58 ... 0x5f:
 +  case 0x98 ... 0x9f:
 +  case 0xd8 ... 0xdf:
-+    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBX);
++    vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RBX);
 +    break;
 +
 +  case 0x20 ... 0x27:
@@ -1231,12 +1236,12 @@ index 0000000..17bee93
 +  case 0xa0 ... 0xa7:
 +  case 0xe0 ... 0xe7:
 +    if (op_size == 1)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RAX);
 +    else
 +    {
 +      printf("KVM: unandled register RSP in modrm16\n");
-+      kp->vcpu.kr->exit_reason = KVM_EXIT_UNKNOWN;
-+      kp->vcpu.kr->hw.hardware_exit_reason = 10;
++      vcpu->kr->exit_reason = KVM_EXIT_UNKNOWN;
++      vcpu->kr->hw.hardware_exit_reason = 10;
 +      return (1);
 +    }
 +    break;
@@ -1246,9 +1251,9 @@ index 0000000..17bee93
 +  case 0xa8 ... 0xaf:
 +  case 0xe8 ... 0xef:
 +    if (op_size == 1)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RCX);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RCX);
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBP);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RBP);
 +    break;
 +
 +  case 0x30 ... 0x37:
@@ -1256,9 +1261,9 @@ index 0000000..17bee93
 +  case 0xb0 ... 0xb7:
 +  case 0xf0 ... 0xf7:
 +    if (op_size == 1)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDX);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RDX);
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RSI);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RSI);
 +    break;
 +
 +  case 0x38 ... 0x3f:
@@ -1266,26 +1271,26 @@ index 0000000..17bee93
 +  case 0xb8 ... 0xbf:
 +  case 0xf8 ... 0xff:
 +    if (op_size == 1)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBX);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RBX);
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDI);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RDI);
 +    break;
 +  }
 +  // set instruction size
 +  if (*modrm < 0x40)
 +  {
 +    if ((*modrm % 8) == 6)
-+      kp->vcpu.insn_len += 2;
++      vcpu->insn_len += 2;
 +    return (0);
 +  }
 +  if (*modrm < 0x80)
 +  {
-+    kp->vcpu.insn_len += 1;
++    vcpu->insn_len += 1;
 +    return (0);
 +  }
 +  if (*modrm < 0xc0)
 +  {
-+    kp->vcpu.insn_len += 2;
++    vcpu->insn_len += 2;
 +    return (0);
 +  }
 +
@@ -1297,6 +1302,8 @@ index 0000000..17bee93
 +		   u_int32_t prfx, u_int64_t rip,
 +		   u_int32_t op_size, struct kvm_sregs *s)
 +{
++  struct kvm_vcpu *vcpu = curproc->p_kvm_vcpu;
++  
 +  //  if protection not enabled, use 16 bits modrm, or protected 16bits
 +  if (!(s->cr0 & 1) ||
 +      (!(s->efer & (1 << 10)) && !s->cs.db) ||
@@ -1307,158 +1314,158 @@ index 0000000..17bee93
 +  {
 +    // RAX / R8
 +  case 0x84:
-+    kp->vcpu.insn_len++;
++    vcpu->insn_len++;
 +  case 0x80 ... 0x83:
 +  case 0x85 ... 0x87:
 +  case 0x05:
-+    kp->vcpu.insn_len += 3;
++    vcpu->insn_len += 3;
 +  case 0x40 ... 0x43:
 +  case 0x45 ... 0x47:
-+    kp->vcpu.insn_len += 1;
++    vcpu->insn_len += 1;
 +  case 0x00 ... 0x03:
 +  case 0x06 ... 0x07:
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R8);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R8);
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RAX);
 +    break;
 +  case 0x04:
 +    if ((modrm[1] & 0b111) == 5)
-+      kp->vcpu.insn_len += 5;
++      vcpu->insn_len += 5;
 +    else
-+      kp->vcpu.insn_len++;
++      vcpu->insn_len++;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R8);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R8);
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RAX);
 +    break;
 +  case 0x44:
-+    kp->vcpu.insn_len += 2;
++    vcpu->insn_len += 2;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R8);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R8);
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RAX);
 +    break;
 +    
 +    // RCX / R9
 +  case 0x8c:
-+    kp->vcpu.insn_len++;
++    vcpu->insn_len++;
 +  case 0x88 ... 0x8b:
 +  case 0x8d ... 0x8f:
 +  case 0x0d:
-+    kp->vcpu.insn_len += 3;
++    vcpu->insn_len += 3;
 +  case 0x48 ... 0x4b:
 +  case 0x4d ... 0x4f:
-+    kp->vcpu.insn_len += 1;
++    vcpu->insn_len += 1;
 +  case 0x08 ... 0x0b:
 +  case 0x0e ... 0x0f:
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R9);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R9);
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RCX);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RCX);
 +    break;
 +  case 0x0c:
 +    if ((modrm[1] & 0b111) == 5)
-+      kp->vcpu.insn_len += 5;
++      vcpu->insn_len += 5;
 +    else
-+      kp->vcpu.insn_len++;
++      vcpu->insn_len++;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R9);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R9);
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RCX);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RCX);
 +    break;
 +  case 0x4c:
-+    kp->vcpu.insn_len += 2;
++    vcpu->insn_len += 2;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R9);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R9);
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RCX);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RCX);
 +    break;
 +
 +    // RDX / R10
 +  case 0x94:
-+    kp->vcpu.insn_len++;
++    vcpu->insn_len++;
 +  case 0x90 ... 0x93:
 +  case 0x95 ... 0x97:
 +  case 0x15:
-+    kp->vcpu.insn_len += 3;
++    vcpu->insn_len += 3;
 +  case 0x50 ... 0x53:
 +  case 0x55 ... 0x57:
-+    kp->vcpu.insn_len += 1;
++    vcpu->insn_len += 1;
 +  case 0x10 ... 0x13:
 +  case 0x16 ... 0x17:
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R10);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R10);
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDX);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RDX);
 +    break;
 +  case 0x14:
 +    if ((modrm[1] & 0b111) == 5)
-+      kp->vcpu.insn_len += 5;
++      vcpu->insn_len += 5;
 +    else
-+      kp->vcpu.insn_len++;
++      vcpu->insn_len++;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R10);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R10);
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDX);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RDX);
 +    break;
 +  case 0x54:
-+    kp->vcpu.insn_len += 2;
++    vcpu->insn_len += 2;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R10);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R10);
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDX);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RDX);
 +    break;
 +    
 +    // RBX / R11
 +  case 0x9c:
-+    kp->vcpu.insn_len++;
++    vcpu->insn_len++;
 +  case 0x98 ... 0x9b:
 +  case 0x9d ... 0x9f:
 +  case 0x1d:
-+    kp->vcpu.insn_len += 3;
++    vcpu->insn_len += 3;
 +  case 0x58 ... 0x5b:
 +  case 0x5d ... 0x5f:
-+    kp->vcpu.insn_len += 1;
++    vcpu->insn_len += 1;
 +  case 0x18 ... 0x1b:
 +  case 0x1e ... 0x1f:
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R11);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R11);
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBX);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RBX);
 +    break;
 +  case 0x1c:
 +    if ((modrm[1] & 0b111) == 5)
-+      kp->vcpu.insn_len += 5;
++      vcpu->insn_len += 5;
 +    else
-+      kp->vcpu.insn_len++;
++      vcpu->insn_len++;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R11);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R11);
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBX); 
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RBX); 
 +    break;
 +  case 0x5c:
-+    kp->vcpu.insn_len += 2;
++    vcpu->insn_len += 2;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R11);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R11);
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBX); 
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RBX); 
 +    break;
 +
 +    // RSP / R12
 +  case 0xa4:
-+    kp->vcpu.insn_len++;
++    vcpu->insn_len++;
 +  case 0xa0 ... 0xa3:
 +  case 0xa5 ... 0xa7:
 +  case 0x25:
-+    kp->vcpu.insn_len += 3;
++    vcpu->insn_len += 3;
 +  case 0x60 ... 0x63:
 +  case 0x65 ... 0x67:
-+    kp->vcpu.insn_len += 1;
++    vcpu->insn_len += 1;
 +  case 0x20 ... 0x23:
 +  case 0x26 ... 0x27:
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R12);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R12);
 +    else
 +    {
 +      if (op_size != 1)
@@ -1477,14 +1484,14 @@ index 0000000..17bee93
 +	return (1);
 +      }
 +      else
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX) + 1;
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RAX) + 1;
 +    }
 +    break;
 +  case 0x24:
 +    if ((modrm[1] & 0b111) == 5)
-+      kp->vcpu.insn_len += 5;
++      vcpu->insn_len += 5;
 +    else
-+      kp->vcpu.insn_len++;
++      vcpu->insn_len++;
 +    if (op_size != 1)
 +    {
 +      printf("KVM: unandled register RSP in modrm\n");
@@ -1501,10 +1508,10 @@ index 0000000..17bee93
 +      return (1);
 +    }
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX) + 1;
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RAX) + 1;
 +    break;
 +  case 0x64:
-+    kp->vcpu.insn_len += 2;
++    vcpu->insn_len += 2;
 +    if (op_size != 1)
 +    {
 +      printf("KVM: unandled register RSP in modrm\n");
@@ -1521,157 +1528,157 @@ index 0000000..17bee93
 +      return (1);
 +    }
 +    else
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX) + 1;
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RAX) + 1;
 +    break;
 +
 +    // RBP / R13
 +  case 0xac:
-+    kp->vcpu.insn_len++;
++    vcpu->insn_len++;
 +  case 0xa8 ... 0xab:
 +  case 0xad ... 0xaf:
 +  case 0x2d:
-+    kp->vcpu.insn_len += 3;
++    vcpu->insn_len += 3;
 +  case 0x68 ... 0x6b:
 +  case 0x6d ... 0x6f:
-+    kp->vcpu.insn_len += 1;
++    vcpu->insn_len += 1;
 +  case 0x28 ... 0x2b:
 +  case 0x2e ... 0x2f:
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R13);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R13);
 +    else
 +      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
 +	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
 +	  (op_size == 1))
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RCX) + 1;
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RCX) + 1;
 +      else
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBP);
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RBP);
 +    break;
 +  case 0x2c:
 +    if ((modrm[1] & 0b111) == 5)
-+      kp->vcpu.insn_len += 5;
++      vcpu->insn_len += 5;
 +    else
-+      kp->vcpu.insn_len++;
++      vcpu->insn_len++;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R13);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R13);
 +    else
 +      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
 +	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
 +	  (op_size == 1))
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RCX) + 1;
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RCX) + 1;
 +      else
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBP);
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RBP);
 +    break;
 +  case 0x6c:
-+    kp->vcpu.insn_len += 2;
++    vcpu->insn_len += 2;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R13);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R13);
 +    else
 +      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
 +	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
 +	  (op_size == 1))
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RCX) + 1;
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RCX) + 1;
 +      else
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBP);
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RBP);
 +    break;
 +    
 +    // RSI / R14
 +  case 0xb4:
-+    kp->vcpu.insn_len++;
++    vcpu->insn_len++;
 +  case 0xb0 ... 0xb3:
 +  case 0xb5 ... 0xb7:
 +  case 0x35:
-+    kp->vcpu.insn_len += 3;
++    vcpu->insn_len += 3;
 +  case 0x70 ... 0x73:
 +  case 0x75 ... 0x77:
-+    kp->vcpu.insn_len += 1;
++    vcpu->insn_len += 1;
 +  case 0x30 ... 0x33:
 +  case 0x36 ... 0x37:
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R14);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R14);
 +    else
 +      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
 +	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
 +	  (op_size == 1))
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDX) + 1;
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RDX) + 1;
 +      else
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RSI);
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RSI);
 +    break;
 +  case 0x34:
 +    if ((modrm[1] & 0b111) == 5)
-+      kp->vcpu.insn_len += 5;
++      vcpu->insn_len += 5;
 +    else
-+      kp->vcpu.insn_len++;
++      vcpu->insn_len++;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R14);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R14);
 +    else
 +      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
 +	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
 +	  (op_size == 1))
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDX) + 1;
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RDX) + 1;
 +      else
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RSI);
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RSI);
 +    break;
 +  case 0x74:
-+    kp->vcpu.insn_len += 2;
++    vcpu->insn_len += 2;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R14);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R14);
 +    else
 +      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
 +	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
 +	  (op_size == 1))
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDX) + 1;
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RDX) + 1;
 +      else
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RSI);
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RSI);
 +    break;
 +
 +    // RDI / R15
 +  case 0xbc:
-+    kp->vcpu.insn_len++;
++    vcpu->insn_len++;
 +  case 0xb8 ... 0xbb:
 +  case 0xbd ... 0xbf:
 +  case 0x3d:
-+    kp->vcpu.insn_len += 3;
++    vcpu->insn_len += 3;
 +  case 0x78 ... 0x7b:
 +  case 0x7d ... 0x7f:
-+    kp->vcpu.insn_len += 1;
++    vcpu->insn_len += 1;
 +  case 0x38 ... 0x3b:
 +  case 0x3e ... 0x3f:
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R15);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R15);
 +    else
 +      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
 +	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
 +	  (op_size == 1))
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBX) + 1;
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RBX) + 1;
 +      else
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDI);
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RDI);
 +    break;
 +  case 0x3c:
 +    if ((modrm[1] & 0b111) == 5)
-+      kp->vcpu.insn_len += 5;
++      vcpu->insn_len += 5;
 +    else
-+      kp->vcpu.insn_len++;
++      vcpu->insn_len++;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R15);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R15);
 +    else
 +      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
 +	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
 +	  (op_size == 1))
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBX) + 1;
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RBX) + 1;
 +      else
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDI);
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RDI);
 +    break;
 +  case 0x7c:
-+    kp->vcpu.insn_len += 2;
++    vcpu->insn_len += 2;
 +    if (prfx & PRFX_REXR)
-+      kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_R15);
++      vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_R15);
 +    else
 +      if (!(prfx & PRFX_REX) && !(prfx & PRFX_REXW) &&
 +	  !(prfx & PRFX_REXX) && !(prfx & PRFX_REXB) &&
 +	  (op_size == 1))
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RBX) + 1;
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RBX) + 1;
 +      else
-+	kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RDI);
++	vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RDI);
 +    break;
 +    
 +  default: // modrm not handled
@@ -1823,32 +1830,34 @@ index 0000000..17bee93
 +		       u_int32_t *op_size, u_int32_t *addr_size,
 +		       u_int32_t prfx)
 +{
++  struct kvm_vcpu *vcpu = curproc->p_kvm_vcpu;
++  
 +  // size
 +  if (s->cr0 & 1) // PE
 +  {
 +    if ((s->efer & (1 << 10)) && s->cs.l)
 +    {
-+      *op_size = kp->vcpu.mmio.size = 4;
++      *op_size = vcpu->mmio.size = 4;
 +      *addr_size = 8;
 +    }
 +    else
 +    {
 +      if (s->cs.db) // default size
-+	*op_size = *addr_size = kp->vcpu.mmio.size = 4;
++	*op_size = *addr_size = vcpu->mmio.size = 4;
 +      else
-+	*op_size = *addr_size = kp->vcpu.mmio.size = 2;
++	*op_size = *addr_size = vcpu->mmio.size = 2;
 +    }
 +  }
 +  else
-+    *op_size = *addr_size = kp->vcpu.mmio.size = 2;
++    *op_size = *addr_size = vcpu->mmio.size = 2;
 +
 +  if (prfx & PRFX_OPSIZE)
 +  {
 +    if (*op_size == 2)
-+      *op_size = kp->vcpu.mmio.size = 4;
++      *op_size = vcpu->mmio.size = 4;
 +    else
 +      if (*op_size == 4)
-+	*op_size = kp->vcpu.mmio.size = 2;
++	*op_size = vcpu->mmio.size = 2;
 +  }
 +
 +  if (prfx & PRFX_ADDRSIZE)
@@ -1864,11 +1873,12 @@ index 0000000..17bee93
 +  }
 +  
 +  if (prfx & PRFX_REXW)
-+    kp->vcpu.mmio.size = *op_size = 8;
++    vcpu->mmio.size = *op_size = 8;
 +}
 +
 +void kvm_handle_mmio(struct kvm_run *run, struct kvm_p *kp)
 +{
++  struct kvm_vcpu *vcpu = curproc->p_kvm_vcpu;
 +  struct kvm_sregs s;
 +  struct kvm_regs r;
 +  u_int32_t addr_size;
@@ -1882,27 +1892,27 @@ index 0000000..17bee93
 +  int i;
 +  int j;
 +
-+  kvm_hw->get_sregs(kp->hw_data, &s, kp);
-+  kvm_hw->get_regs(kp->hw_data, &r);
++  kvm_hw->get_sregs(vcpu->hw_data, &s, kp);
++  kvm_hw->get_regs(vcpu->hw_data, &r);
 +  
 +  // instruction fetch is an error
-+  if (kp->vcpu.mmio.acc & 0b100)
++  if (vcpu->mmio.acc & 0b100)
 +  {
 +    printf("KVM: trying to execute outside of guest RAM @%llx\n",
-+	   kp->vcpu.mmio.gpaddr);
++	   vcpu->mmio.gpaddr);
 +    run->exit_reason = KVM_EXIT_UNKNOWN;
 +    run->hw.hardware_exit_reason = 18;
 +    return;
 +  }
 +  
 +  // check for a write to a RX page (for dirty log / RO memory)
-+  if ((kp->vcpu.mmio.acc & 0b10) && (kp->vcpu.mmio.acc & 1))
++  if ((vcpu->mmio.acc & 0b10) && (vcpu->mmio.acc & 1))
 +  {
 +    // mark it dirty in the bitmap
-+    if (!kvm_set_dirty_bmap(kp, kp->vcpu.mmio.gpaddr))
++    if (!kvm_set_dirty_bmap(kp, vcpu->mmio.gpaddr))
 +    {
 +      // set the page writeable if dirty logging
-+      kvm_set_prot(kp, kp->vcpu.mmio.gpaddr, KVM_RWX);
++      kvm_set_prot(kp, vcpu->mmio.gpaddr, KVM_RWX);
 +      return;
 +    }
 +    // return to userland for RO memory write
@@ -1936,18 +1946,18 @@ index 0000000..17bee93
 +  insn = (void *)(kp->mem[i].vaddr + (rip - kp->mem[i].gpaddr));
 +
 +  // direction
-+  kp->vcpu.mmio.dir = (kp->vcpu.mmio.acc >> 1) & 1;
++  vcpu->mmio.dir = (vcpu->mmio.acc >> 1) & 1;
 +  
 +  // instruction decoding
 +  prfx = 0;
 +  kvm_emul_prefix_decode(&insn, &prfx);
 +  kvm_emul_get_size(kp, &s, &op_size, &addr_size, prfx);
-+  kp->vcpu.mmio.flag = KVM_MMIO_MOV;
++  vcpu->mmio.flag = KVM_MMIO_MOV;
 +  
 +  switch (*insn)
 +  {
 +  case 0x0a: // OR R8, [R/M8]
-+    if (kp->vcpu.mmio.dir)
++    if (vcpu->mmio.dir)
 +    {
 +      printf("KVM: opcode @%llx [%02x] is a read, exit is a write\n",
 +	     rip, *insn);
@@ -1955,9 +1965,9 @@ index 0000000..17bee93
 +      run->hw.hardware_exit_reason = 21;
 +      return;
 +    }
-+    kp->vcpu.insn_len = 2;
-+    kp->vcpu.mmio.flag = KVM_MMIO_OR;
-+    op_size = kp->vcpu.mmio.size = 1;
++    vcpu->insn_len = 2;
++    vcpu->mmio.flag = KVM_MMIO_OR;
++    op_size = vcpu->mmio.size = 1;
 +    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, op_size, &s))
 +      return;
 +    break;
@@ -1966,9 +1976,9 @@ index 0000000..17bee93
 +    switch (insn[1])
 +    {
 +    case 0xb6: // MOVZX R32, [R/M8]
-+      kp->vcpu.mmio.size = 1;
++      vcpu->mmio.size = 1;
 +    case 0xb7: // MOVZX R32, [R/M16]
-+      if (kp->vcpu.mmio.dir)
++      if (vcpu->mmio.dir)
 +      {
 +	printf("KVM: opcode @%llx [0f%02x] is a read, exit is a write\n",
 +	       rip, insn[1]);
@@ -1976,15 +1986,15 @@ index 0000000..17bee93
 +	run->hw.hardware_exit_reason = 22;
 +	return;
 +      }
-+      kp->vcpu.insn_len = 3;
++      vcpu->insn_len = 3;
 +      if (kvm_emul_modrm(kp, run, insn + 2, prfx, rip, op_size, &s))
 +	return;
 +      if (op_size == 8)
-+	*(u_int64_t *)(kp->vcpu.mmio.ptr) = 0;
++	*(u_int64_t *)(vcpu->mmio.ptr) = 0;
 +      if (op_size == 4)
-+	*(u_int32_t *)(kp->vcpu.mmio.ptr) = 0;
++	*(u_int32_t *)(vcpu->mmio.ptr) = 0;
 +      if (op_size == 2)
-+	*(u_int16_t *)(kp->vcpu.mmio.ptr) = 0;
++	*(u_int16_t *)(vcpu->mmio.ptr) = 0;
 +      break;
 +    default:
 +      printf("KVM: insn decoder unknown opcode @%llx "
@@ -1997,7 +2007,7 @@ index 0000000..17bee93
 +    break;
 +    
 +  case 0x23: // AND R, [OFF16/32]
-+    if (kp->vcpu.mmio.dir)
++    if (vcpu->mmio.dir)
 +    {
 +      printf("KVM: opcode @%llx [%02x] is a read, exit is a write\n",
 +	     rip, *insn);
@@ -2005,14 +2015,14 @@ index 0000000..17bee93
 +      run->hw.hardware_exit_reason = 24;
 +      return;
 +    }
-+    kp->vcpu.insn_len = 2;
-+    kp->vcpu.mmio.flag = KVM_MMIO_AND;
++    vcpu->insn_len = 2;
++    vcpu->mmio.flag = KVM_MMIO_AND;
 +    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, op_size, &s))
 +      return;
 +    break;
 +
 +  case 0x81:
-+    if (kp->vcpu.mmio.dir)
++    if (vcpu->mmio.dir)
 +    {
 +      printf("KVM: opcode @%llx [%02x] is a read, exit is a write\n",
 +	     rip, *insn);
@@ -2023,9 +2033,9 @@ index 0000000..17bee93
 +    switch ((insn[1] >> 3) & 0x7)
 +    {
 +    case 7: // CMP [R], IMM32
-+      kp->vcpu.insn_len = 2 + op_size;
-+      kp->vcpu.mmio.flag = KVM_MMIO_CMP;
-+      kp->vcpu.mmio.ptr = (void *)(insn + 2);
++      vcpu->insn_len = 2 + op_size;
++      vcpu->mmio.flag = KVM_MMIO_CMP;
++      vcpu->mmio.ptr = (void *)(insn + 2);
 +      break;
 +    default:
 +      printf("KVM: insn decoder unknown opcode @%llx [%02x%02x]\n",
@@ -2037,7 +2047,7 @@ index 0000000..17bee93
 +    break;
 +
 +  case 0x83:
-+    if (!kp->vcpu.mmio.dir)
++    if (!vcpu->mmio.dir)
 +    {
 +      printf("KVM: opcode @%llx [%02x] is a write, exit is a read\n",
 +	     rip, *insn);
@@ -2048,11 +2058,11 @@ index 0000000..17bee93
 +    switch ((insn[1] >> 3) & 0x7)
 +    {
 +    case 1: // OR [R], IMM8
-+      kp->vcpu.insn_len = 3;
-+      kp->vcpu.mmio.flag = KVM_MMIO_OR | KVM_MMIO_TO_MMIO;
-+      kp->vcpu.mmio.ptr2 = *(u_int8_t *)(insn + 2);
-+      kp->vcpu.mmio.ptr = &(kp->vcpu.mmio.ptr2);
-+      kp->vcpu.mmio.dir = 0;
++      vcpu->insn_len = 3;
++      vcpu->mmio.flag = KVM_MMIO_OR | KVM_MMIO_TO_MMIO;
++      vcpu->mmio.ptr2 = *(u_int8_t *)(insn + 2);
++      vcpu->mmio.ptr = &(vcpu->mmio.ptr2);
++      vcpu->mmio.dir = 0;
 +      break;
 +    default:
 +      printf("KVM: insn decoder unknown opcode @%llx [%02x%02x]\n",
@@ -2064,9 +2074,9 @@ index 0000000..17bee93
 +    break;
 +    
 +  case 0x88: // MOV [R/IMM8], R
-+    op_size = kp->vcpu.mmio.size = 1;
++    op_size = vcpu->mmio.size = 1;
 +  case 0x89: // MOV [R/IMM16/32], R
-+    if (!kp->vcpu.mmio.dir)
++    if (!vcpu->mmio.dir)
 +    {
 +      printf("KVM: opcode @%llx [%02x] is a write, exit is a read\n",
 +	     rip, *insn);
@@ -2074,15 +2084,15 @@ index 0000000..17bee93
 +      run->hw.hardware_exit_reason = 28;
 +      return;
 +    }
-+    kp->vcpu.insn_len = 2;
++    vcpu->insn_len = 2;
 +    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, op_size, &s))
 +      return;
 +    break;
 +
 +  case 0x8a: // MOV R8, [R/M8]
-+    op_size = kp->vcpu.mmio.size = 1;
++    op_size = vcpu->mmio.size = 1;
 +  case 0x8b: // MOV R, [IMM16/32]
-+    if (kp->vcpu.mmio.dir)
++    if (vcpu->mmio.dir)
 +    {
 +      printf("KVM: opcode @%llx [%02x] is a read, exit is a write\n",
 +	     rip, *insn);
@@ -2090,13 +2100,13 @@ index 0000000..17bee93
 +      run->hw.hardware_exit_reason = 30;
 +      return;
 +    }
-+    kp->vcpu.insn_len = 2;
++    vcpu->insn_len = 2;
 +    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, op_size, &s))
 +      return;
 +    break;
 +
 +  case 0xa1: // MOV [E]AX, [IMM16/32]
-+    if (kp->vcpu.mmio.dir)
++    if (vcpu->mmio.dir)
 +    {
 +      printf("KVM: opcode @%llx [%02x] is a read, exit is a write\n",
 +	     rip, *insn);
@@ -2104,12 +2114,12 @@ index 0000000..17bee93
 +      run->hw.hardware_exit_reason = 31;
 +      return;
 +    }
-+    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
-+    kp->vcpu.insn_len = addr_size + 1;
++    vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RAX);
++    vcpu->insn_len = addr_size + 1;
 +    break;
 +    
 +  case 0xa3: // MOV [OFF16/32/64], [R]AX
-+    if (!kp->vcpu.mmio.dir)
++    if (!vcpu->mmio.dir)
 +    {
 +      printf("KVM: opcode @%llx [%02x] is a write, exit is a read\n",
 +	     rip, *insn);
@@ -2117,12 +2127,12 @@ index 0000000..17bee93
 +      run->hw.hardware_exit_reason = 32;
 +      return;
 +    }
-+    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
-+    kp->vcpu.insn_len = addr_size + 1;
++    vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RAX);
++    vcpu->insn_len = addr_size + 1;
 +    break;
 +
 +  case 0xa4: // MOVSB
-+    op_size = kp->vcpu.mmio.size = 1;
++    op_size = vcpu->mmio.size = 1;
 +  case 0xa5: // MOVSL
 +    val = s.ds.base + (r.rsi & ((addr_size == 2) ? 0xffff :
 +				((addr_size == 4) ? 0xffffffff :
@@ -2148,7 +2158,7 @@ index 0000000..17bee93
 +    // MMIO to MMIO
 +    if ((i == 32) && (j == 32))
 +    {
-+      if (kp->vcpu.mmio.dir)
++      if (vcpu->mmio.dir)
 +      {
 +	printf("KVM: exit is a write during MMIO to MMIO MOVS copy\n");
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
@@ -2156,54 +2166,54 @@ index 0000000..17bee93
 +	return;
 +      }
 +      // MMIO to MMIO copy
-+      kp->vcpu.mmio.flag = KVM_MMIO_TO_MMIO;
-+      kp->vcpu.mmio.ptr2 = val2;
++      vcpu->mmio.flag = KVM_MMIO_TO_MMIO;
++      vcpu->mmio.ptr2 = val2;
 +    }
 +    // MMIO read
 +    else if (i == 32)
 +    {
-+      if (kp->vcpu.mmio.dir)
++      if (vcpu->mmio.dir)
 +      {
 +	printf("KVM: exit is a write insn is a read\n");
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
 +	run->hw.hardware_exit_reason = 53;
 +	return;
 +      }
-+      kp->vcpu.mmio.ptr = (void *)(kp->mem[j].vaddr +
++      vcpu->mmio.ptr = (void *)(kp->mem[j].vaddr +
 +				   (val2 - kp->mem[j].gpaddr));
-+      kp->vcpu.mmio.flag = KVM_MMIO_MOV;
++      vcpu->mmio.flag = KVM_MMIO_MOV;
 +    }
 +    // MMIO write
 +    else if (j == 32)
 +    {
-+      if (!kp->vcpu.mmio.dir)
++      if (!vcpu->mmio.dir)
 +      {
 +	printf("KVM: exit is a read insn is a write\n");
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
 +	run->hw.hardware_exit_reason = 54;
 +	return;
 +      }
-+      kp->vcpu.mmio.ptr = (void *)(kp->mem[i].vaddr +
++      vcpu->mmio.ptr = (void *)(kp->mem[i].vaddr +
 +				   (val - kp->mem[i].gpaddr));
-+      kp->vcpu.mmio.flag = KVM_MMIO_MOV;
++      vcpu->mmio.flag = KVM_MMIO_MOV;
 +    }
 +    // increment or decrement esi edi
 +    if (r.rflags & (1 << 10))
 +    {
-+      r.rsi -= kp->vcpu.mmio.size;
-+      r.rdi -= kp->vcpu.mmio.size;
++      r.rsi -= vcpu->mmio.size;
++      r.rdi -= vcpu->mmio.size;
 +    }
 +    else
 +    {
-+      r.rsi += kp->vcpu.mmio.size;
-+      r.rdi += kp->vcpu.mmio.size;
++      r.rsi += vcpu->mmio.size;
++      r.rdi += vcpu->mmio.size;
 +    }
-+    kvm_hw->set_regs(kp->hw_data, &r);
-+    kp->vcpu.insn_len = 1;
++    kvm_hw->set_regs(vcpu->hw_data, &r);
++    vcpu->insn_len = 1;
 +    break;
 +
 +  case 0xab: // STOS
-+    if (!kp->vcpu.mmio.dir)
++    if (!vcpu->mmio.dir)
 +    {
 +      printf("KVM: opcode @%llx [%02x] is a write, exit is a read\n",
 +	     rip, *insn);
@@ -2211,20 +2221,20 @@ index 0000000..17bee93
 +      run->hw.hardware_exit_reason = 34;
 +      return;
 +    }
-+    kp->vcpu.mmio.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
++    vcpu->mmio.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RAX);
 +    // increment or decrement RDI
 +    if (r.rflags & (1 << 10))
-+      r.rdi -= kp->vcpu.mmio.size;
++      r.rdi -= vcpu->mmio.size;
 +    else
-+      r.rdi += kp->vcpu.mmio.size;
-+    kvm_hw->set_regs(kp->hw_data, &r);
-+    kp->vcpu.insn_len = 1;
++      r.rdi += vcpu->mmio.size;
++    kvm_hw->set_regs(vcpu->hw_data, &r);
++    vcpu->insn_len = 1;
 +    break;
 +
 +  case 0xc6: // MOV [OFF16/32], IMM8
-+    op_size = kp->vcpu.mmio.size = 1;
++    op_size = vcpu->mmio.size = 1;
 +  case 0xc7: // MOV [OFF16/32], IMM16/32
-+    if (!kp->vcpu.mmio.dir)
++    if (!vcpu->mmio.dir)
 +    {
 +      printf("KVM: opcode @%llx [%02x] is a write, exit is a read\n",
 +	     rip, *insn);
@@ -2232,38 +2242,38 @@ index 0000000..17bee93
 +      run->hw.hardware_exit_reason = 35;
 +      return;
 +    }
-+    val = (kp->vcpu.mmio.size != 8) ? kp->vcpu.mmio.size : 4;
-+    kp->vcpu.insn_len = 2 + val;
++    val = (vcpu->mmio.size != 8) ? vcpu->mmio.size : 4;
++    vcpu->insn_len = 2 + val;
 +    if (kvm_emul_modrm(kp, run, insn + 1, prfx, rip, op_size, &s))
 +      return;
-+    kp->vcpu.mmio.ptr = (void *)(insn + kp->vcpu.insn_len - val);
++    vcpu->mmio.ptr = (void *)(insn + vcpu->insn_len - val);
 +    if (prfx & PRFX_REXW)
 +    {
-+      signext = *(int32_t *)(insn + kp->vcpu.insn_len - val);
-+      kp->vcpu.mmio.ptr = (void *)&signext;
++      signext = *(int32_t *)(insn + vcpu->insn_len - val);
++      vcpu->mmio.ptr = (void *)&signext;
 +    }
 +    break;
 +    
 +  default: // opcode not handled yet
-+    printf("KVM: insn decoder unknown opcode @%llx [%02x]\n",
-+	   rip, *insn);
++    printf("KVM: insn decoder unknown opcode @%llx [%02x] %llx\n",
++	   rip, *insn, vcpu->mmio.gpaddr);
 +    run->exit_reason = KVM_EXIT_UNKNOWN;
 +    run->hw.hardware_exit_reason = 36;
 +    return;
 +  }
 +
 +  if (prfx & PRFX_SEG_ES)
-+    kp->vcpu.insn_len++;
++    vcpu->insn_len++;
 +
 +  if (prfx & PRFX_ADDRSIZE)
-+    kp->vcpu.insn_len++;
++    vcpu->insn_len++;
 +
 +  if (prfx & PRFX_OPSIZE)
-+    kp->vcpu.insn_len++;
++    vcpu->insn_len++;
 +
 +  if ((prfx & PRFX_REXR) || (prfx & PRFX_REXB) || (prfx & PRFX_REXW) ||
 +      (prfx & PRFX_REXX) || (prfx & PRFX_REX))
-+    kp->vcpu.insn_len++;
++    vcpu->insn_len++;
 +
 +  if (prfx & PRFX_REP)
 +  {
@@ -2272,48 +2282,48 @@ index 0000000..17bee93
 +    case 2:
 +      (*(u_int16_t *)(&r.rcx))--;
 +      if (!(r.rcx & 0xffff))
-+	kp->vcpu.insn_len++;
++	vcpu->insn_len++;
 +      else
-+	kp->vcpu.insn_len = 0;
++	vcpu->insn_len = 0;
 +      break;
 +    case 4:
 +      (*(u_int32_t *)(&r.rcx))--;
 +      if (!(r.rcx & 0xffffffff))
-+	kp->vcpu.insn_len++;
++	vcpu->insn_len++;
 +      else
-+	kp->vcpu.insn_len = 0;
++	vcpu->insn_len = 0;
 +    case 8:
 +      (*(u_int64_t *)(&r.rcx))--;
 +      if (!r.rcx)
-+	kp->vcpu.insn_len++;
++	vcpu->insn_len++;
 +      else
-+	kp->vcpu.insn_len = 0;
++	vcpu->insn_len = 0;
 +      break;
 +    }
-+    kvm_hw->set_regs(kp->hw_data, &r);
++    kvm_hw->set_regs(vcpu->hw_data, &r);
 +  }
 +
-+  kp->vcpu.mmio.flag |= KVM_MMIO_EN;
++  vcpu->mmio.flag |= KVM_MMIO_EN;
 +  run->exit_reason = KVM_EXIT_MMIO;
-+  run->mmio.phys_addr = kp->vcpu.mmio.gpaddr;
-+  run->mmio.len = kp->vcpu.mmio.size;
-+  run->mmio.is_write = kp->vcpu.mmio.dir;
++  run->mmio.phys_addr = vcpu->mmio.gpaddr;
++  run->mmio.len = vcpu->mmio.size;
++  run->mmio.is_write = vcpu->mmio.dir;
 +
 +  // write
-+  if (kp->vcpu.mmio.dir)
-+    switch (kp->vcpu.mmio.size)
++  if (vcpu->mmio.dir)
++    switch (vcpu->mmio.size)
 +    {
 +    case 1:
-+      *(u_int8_t *)(&(run->mmio.data)) = *(u_int8_t *)(kp->vcpu.mmio.ptr);
++      *(u_int8_t *)(&(run->mmio.data)) = *(u_int8_t *)(vcpu->mmio.ptr);
 +      break;
 +    case 2:
-+      *(u_int16_t *)(&(run->mmio.data)) = *(u_int16_t *)(kp->vcpu.mmio.ptr);
++      *(u_int16_t *)(&(run->mmio.data)) = *(u_int16_t *)(vcpu->mmio.ptr);
 +      break;
 +    case 4:
-+      *(u_int32_t *)(&(run->mmio.data)) = *(u_int32_t *)(kp->vcpu.mmio.ptr);
++      *(u_int32_t *)(&(run->mmio.data)) = *(u_int32_t *)(vcpu->mmio.ptr);
 +      break;
 +    case 8:
-+      *(u_int64_t *)(&(run->mmio.data)) = *(u_int64_t *)(kp->vcpu.mmio.ptr);
++      *(u_int64_t *)(&(run->mmio.data)) = *(u_int64_t *)(vcpu->mmio.ptr);
 +      break;
 +    }
 +  else
@@ -2325,21 +2335,22 @@ index 0000000..17bee93
 +void kvm_handle_io(void *hw, struct kvm_run *run, struct kvm_p *kp,
 +		   u_int64_t off)
 +{
++  struct kvm_vcpu *vcpu = curproc->p_kvm_vcpu;
 +  struct kvm_sregs s;
 +  struct kvm_regs r;
 +  u_int64_t val;
 +  int i;
 +
-+  kvm_hw->get_sregs(kp->hw_data, &s, kp);
-+  kvm_hw->get_regs(kp->hw_data, &r);
++  kvm_hw->get_sregs(vcpu->hw_data, &s, kp);
++  kvm_hw->get_regs(vcpu->hw_data, &r);
 +  
 +  // REP prefix ?
-+  if (kp->vcpu.io.rep)
++  if (vcpu->io.rep)
 +  {
-+    if (kp->vcpu.io.str)
++    if (vcpu->io.str)
 +    {
 +      if (off)
-+	run->io.count -= (off / kp->vcpu.io.size);
++	run->io.count -= (off / vcpu->io.size);
 +      else
 +	run->io.count = (u_int32_t)r.rcx;
 +    }
@@ -2353,25 +2364,25 @@ index 0000000..17bee93
 +  }
 +  else
 +    run->io.count = 1;
-+  kp->vcpu.io.count = run->io.count;
++  vcpu->io.count = run->io.count;
 +  
 +  // check IO size
-+  if ((kp->vcpu.io.count * kp->vcpu.io.size) > sizeof(run->s))
++  if ((vcpu->io.count * vcpu->io.size) > sizeof(run->s))
 +  {
-+    run->io.count = sizeof(run->s) / kp->vcpu.io.size;
-+    kp->vcpu.io.count -= run->io.count;
++    run->io.count = sizeof(run->s) / vcpu->io.size;
++    vcpu->io.count -= run->io.count;
 +  }
 +  else
-+    kp->vcpu.io.count = 0;
++    vcpu->io.count = 0;
 +
 +  // string operation
-+  if (kp->vcpu.io.str)
++  if (vcpu->io.str)
 +  {
-+    if (kp->vcpu.io.dir == KVM_EXIT_IO_IN)
++    if (vcpu->io.dir == KVM_EXIT_IO_IN)
 +    {
 +      // operation is at ES:(E)DI
 +      val = s.es.base;
-+      switch (kp->vcpu.io.addr_size)
++      switch (vcpu->io.addr_size)
 +      {
 +      case 2:
 +	val += (r.rdi & 0xffff);
@@ -2383,7 +2394,7 @@ index 0000000..17bee93
 +	val += r.rdi;
 +	break;
 +      default:
-+	printf("KVM: unhandled I/O addr size %x\n", kp->vcpu.io.addr_size);
++	printf("KVM: unhandled I/O addr size %x\n", vcpu->io.addr_size);
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
 +	run->hw.hardware_exit_reason = 38;
 +	return;
@@ -2392,7 +2403,7 @@ index 0000000..17bee93
 +    else
 +    {
 +      // operation is at SEG:(E)SI
-+      switch (kp->vcpu.io.seg)
++      switch (vcpu->io.seg)
 +      {
 +      case 0:
 +	val = s.es.base;
@@ -2413,14 +2424,14 @@ index 0000000..17bee93
 +	val = s.gs.base;
 +	break;
 +      default:
-+	printf("KVM: unhandled segment %x\n", kp->vcpu.io.seg);
++	printf("KVM: unhandled segment %x\n", vcpu->io.seg);
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
 +	run->hw.hardware_exit_reason = 39;
 +	return;
 +      }
 +      
 +      // add (E)SI
-+      switch (kp->vcpu.io.addr_size)
++      switch (vcpu->io.addr_size)
 +      {
 +      case 2:
 +	val += (r.rsi & 0xffff);
@@ -2432,7 +2443,7 @@ index 0000000..17bee93
 +	val += r.rsi;
 +	break;	
 +      default:
-+	printf("KVM: unhandled I/O addr size %x\n", kp->vcpu.io.addr_size);
++	printf("KVM: unhandled I/O addr size %x\n", vcpu->io.addr_size);
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
 +	run->hw.hardware_exit_reason = 40;
 +	return;
@@ -2463,7 +2474,7 @@ index 0000000..17bee93
 +    }
 +    
 +    // check for overflow
-+    if ((val + (run->io.count * kp->vcpu.io.size))
++    if ((val + (run->io.count * vcpu->io.size))
 +	> (kp->mem[i].gpaddr + kp->mem[i].size))
 +    {
 +      printf("KVM: I/O string operation would overflow memory mapping\n");
@@ -2472,35 +2483,35 @@ index 0000000..17bee93
 +      return;
 +    }
 +    
-+    kp->vcpu.io.ptr = (void *)(kp->mem[i].vaddr +
++    vcpu->io.ptr = (void *)(kp->mem[i].vaddr +
 +			       (val - kp->mem[i].gpaddr));    
 +  }
 +  else
-+    kp->vcpu.io.ptr = kvm_hw->get_reg_ptr(kp->hw_data, KVM_REG_RAX);
++    vcpu->io.ptr = kvm_hw->get_reg_ptr(vcpu->hw_data, KVM_REG_RAX);
 +
 +  // if out, do the operation
-+  if (kp->vcpu.io.dir == KVM_EXIT_IO_OUT)
++  if (vcpu->io.dir == KVM_EXIT_IO_OUT)
 +    for (i = 0; i < run->io.count; i++)
-+      switch (kp->vcpu.io.size)
++      switch (vcpu->io.size)
 +      {
 +      case 1:
-+	*(u_int8_t *)kp->vcpu.io.user_ptr = *(u_int8_t *)kp->vcpu.io.ptr;
-+	kp->vcpu.io.user_ptr++;
-+	kp->vcpu.io.ptr++;
++	*(u_int8_t *)vcpu->io.user_ptr = *(u_int8_t *)vcpu->io.ptr;
++	vcpu->io.user_ptr++;
++	vcpu->io.ptr++;
 +	break;
 +      case 2:
-+	*(u_int16_t *)kp->vcpu.io.user_ptr = *(u_int16_t *)kp->vcpu.io.ptr;
-+	kp->vcpu.io.user_ptr += 2;
-+	kp->vcpu.io.ptr += 2;
++	*(u_int16_t *)vcpu->io.user_ptr = *(u_int16_t *)vcpu->io.ptr;
++	vcpu->io.user_ptr += 2;
++	vcpu->io.ptr += 2;
 +	break;
 +      case 4:
-+	*(u_int32_t *)kp->vcpu.io.user_ptr = *(u_int32_t *)kp->vcpu.io.ptr;
-+	kp->vcpu.io.user_ptr += 4;
-+	kp->vcpu.io.ptr += 4;
++	*(u_int32_t *)vcpu->io.user_ptr = *(u_int32_t *)vcpu->io.ptr;
++	vcpu->io.user_ptr += 4;
++	vcpu->io.ptr += 4;
 +	break;
 +      default:
 +	// size unhandled
-+	printf("KVM: I/O op size not handled (%lld)\n", kp->vcpu.io.size);
++	printf("KVM: I/O op size not handled (%lld)\n", vcpu->io.size);
 +	run->exit_reason = KVM_EXIT_UNKNOWN;
 +	run->hw.hardware_exit_reason = 43;
 +	break;
@@ -2509,10 +2520,11 @@ index 0000000..17bee93
 +
 +int kvm_handle_pre_io(struct kvm_run *run, struct kvm_p *kp)
 +{
++  struct kvm_vcpu *vcpu = curproc->p_kvm_vcpu;
 +  int i;
 +
-+  kp->vcpu.io.flag = 0;
-+  if (kp->vcpu.io.dir == KVM_EXIT_IO_IN)
++  vcpu->io.flag = 0;
++  if (vcpu->io.dir == KVM_EXIT_IO_IN)
 +  {
 +    if (run->exit_reason != KVM_EXIT_IO)
 +    {
@@ -2521,22 +2533,22 @@ index 0000000..17bee93
 +    }
 +    for (i = 0; i < run->io.count; i++)
 +    {
-+      switch (kp->vcpu.io.size)
++      switch (vcpu->io.size)
 +      {
 +      case 1:
-+	*(u_int8_t *)kp->vcpu.io.ptr = *(u_int8_t *)kp->vcpu.io.user_ptr;
-+	kp->vcpu.io.user_ptr++;
-+	kp->vcpu.io.ptr++;
++	*(u_int8_t *)vcpu->io.ptr = *(u_int8_t *)vcpu->io.user_ptr;
++	vcpu->io.user_ptr++;
++	vcpu->io.ptr++;
 +	break;
 +      case 2:
-+	*(u_int16_t *)kp->vcpu.io.ptr = *(u_int16_t *)kp->vcpu.io.user_ptr;
-+	kp->vcpu.io.user_ptr += 2;
-+	kp->vcpu.io.ptr += 2;
++	*(u_int16_t *)vcpu->io.ptr = *(u_int16_t *)vcpu->io.user_ptr;
++	vcpu->io.user_ptr += 2;
++	vcpu->io.ptr += 2;
 +	break;
 +      case 4:
-+	*(u_int32_t *)kp->vcpu.io.ptr = *(u_int32_t *)kp->vcpu.io.user_ptr;
-+	kp->vcpu.io.user_ptr += 4;
-+	kp->vcpu.io.ptr += 4;
++	*(u_int32_t *)vcpu->io.ptr = *(u_int32_t *)vcpu->io.user_ptr;
++	vcpu->io.user_ptr += 4;
++	vcpu->io.ptr += 4;
 +	break;
 +      default:
 +	// size unhandled
@@ -2547,7 +2559,7 @@ index 0000000..17bee93
 +  }
 +
 +  // operation not finished
-+  if (kp->vcpu.io.count)
++  if (vcpu->io.count)
 +    return (1);
 +  
 +  return (0);
@@ -2555,20 +2567,21 @@ index 0000000..17bee93
 +
 +int kvm_handle_pre_mmio(struct kvm_run *run, struct kvm_p *kp)
 +{
++  struct kvm_vcpu *vcpu = curproc->p_kvm_vcpu;
 +  struct kvm_regs r;
 +  u_int64_t flags;
 +
-+  if (kp->vcpu.mmio.dir == 0)
++  if (vcpu->mmio.dir == 0)
 +  {
 +    if (run->exit_reason != KVM_EXIT_MMIO)
 +    {
 +      printf("KVM: ERR userland did not fulfill MMIO access\n");
 +      return (-ENXIO);
 +    }
-+    switch (kp->vcpu.mmio.flag)
++    switch (vcpu->mmio.flag)
 +    {
 +    case KVM_MMIO_EN | KVM_MMIO_AND: // AND
-+      switch (kp->vcpu.mmio.size)
++      switch (vcpu->mmio.size)
 +      {
 +      case 1:
 +	asm volatile("mov (%%rbx), %%dl;"
@@ -2576,7 +2589,7 @@ index 0000000..17bee93
 +		     "pushf;"
 +		     "pop %%rax;" :
 +		     "=a"(flags) :
-+		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "a"(vcpu->mmio.ptr), "b"(&(run->mmio.data)) :
 +		     "rdx", "memory", "cc");
 +	break;
 +      case 2:
@@ -2585,7 +2598,7 @@ index 0000000..17bee93
 +		     "pushf;"
 +		     "pop %%rax;" :
 +		     "=a"(flags) :
-+		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "a"(vcpu->mmio.ptr), "b"(&(run->mmio.data)) :
 +		     "rdx", "memory", "cc");
 +	break;
 +      case 4:
@@ -2594,7 +2607,7 @@ index 0000000..17bee93
 +		     "pushf;"
 +		     "pop %%rax;" :
 +		     "=a"(flags) :
-+		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "a"(vcpu->mmio.ptr), "b"(&(run->mmio.data)) :
 +		     "rdx", "memory", "cc");
 +	break;
 +      case 8:
@@ -2603,18 +2616,18 @@ index 0000000..17bee93
 +		     "pushf;"
 +		     "pop %%rax;" :
 +		     "=a"(flags) :
-+		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "a"(vcpu->mmio.ptr), "b"(&(run->mmio.data)) :
 +		     "rdx", "memory", "cc");
 +	break;
 +      }
-+      kvm_hw->get_regs(kp->hw_data, &r);
++      kvm_hw->get_regs(vcpu->hw_data, &r);
 +      r.rflags &= KVM_FLAGS_CLR_MASK;
 +      r.rflags |= (flags & KVM_FLAGS_SET_MASK);
-+      kvm_hw->set_regs(kp->hw_data, &r);
++      kvm_hw->set_regs(vcpu->hw_data, &r);
 +      break;
 +      
 +    case KVM_MMIO_EN | KVM_MMIO_CMP: // CMP
-+      switch (kp->vcpu.mmio.size)
++      switch (vcpu->mmio.size)
 +      {
 +      case 1:
 +	asm volatile("mov (%%rbx), %%dl;"
@@ -2622,7 +2635,7 @@ index 0000000..17bee93
 +		     "pushf;"
 +		     "pop %%rax;" :
 +		     "=a"(flags) :
-+		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "a"(vcpu->mmio.ptr), "b"(&(run->mmio.data)) :
 +		     "rdx", "memory", "cc");
 +	break;
 +      case 2:
@@ -2631,7 +2644,7 @@ index 0000000..17bee93
 +		     "pushf;"
 +		     "pop %%rax;" :
 +		     "=a"(flags) :
-+		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "a"(vcpu->mmio.ptr), "b"(&(run->mmio.data)) :
 +		     "rdx", "memory", "cc");
 +	break;
 +      case 4:
@@ -2640,7 +2653,7 @@ index 0000000..17bee93
 +		     "pushf;"
 +		     "pop %%rax;" :
 +		     "=a"(flags) :
-+		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "a"(vcpu->mmio.ptr), "b"(&(run->mmio.data)) :
 +		     "rdx", "memory", "cc");
 +	break;
 +      case 8:
@@ -2649,19 +2662,19 @@ index 0000000..17bee93
 +		     "pushf;"
 +		     "pop %%rax;" :
 +		     "=a"(flags) :
-+		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "a"(vcpu->mmio.ptr), "b"(&(run->mmio.data)) :
 +		     "rdx", "memory", "cc");
 +	break;
 +      }
-+      kvm_hw->get_regs(kp->hw_data, &r);
++      kvm_hw->get_regs(vcpu->hw_data, &r);
 +      r.rflags &= KVM_FLAGS_CLR_MASK;
 +      r.rflags |= (flags & KVM_FLAGS_SET_MASK);
-+      kvm_hw->set_regs(kp->hw_data, &r);
++      kvm_hw->set_regs(vcpu->hw_data, &r);
 +      break;
 +
 +    case KVM_MMIO_EN | KVM_MMIO_OR | KVM_MMIO_TO_MMIO: // OR
 +    case KVM_MMIO_EN | KVM_MMIO_OR: // OR
-+      switch (kp->vcpu.mmio.size)
++      switch (vcpu->mmio.size)
 +      {
 +      case 1:
 +	asm volatile("mov (%%rbx), %%dl;"
@@ -2669,7 +2682,7 @@ index 0000000..17bee93
 +		     "pushf;"
 +		     "pop %%rax;" :
 +		     "=a"(flags) :
-+		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "a"(vcpu->mmio.ptr), "b"(&(run->mmio.data)) :
 +		     "rdx", "memory", "cc");
 +	break;
 +      case 2:
@@ -2678,7 +2691,7 @@ index 0000000..17bee93
 +		     "pushf;"
 +		     "pop %%rax;" :
 +		     "=a"(flags) :
-+		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "a"(vcpu->mmio.ptr), "b"(&(run->mmio.data)) :
 +		     "rdx", "memory", "cc");
 +	break;
 +      case 4:
@@ -2687,7 +2700,7 @@ index 0000000..17bee93
 +		     "pushf;"
 +		     "pop %%rax;" :
 +		     "=a"(flags) :
-+		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "a"(vcpu->mmio.ptr), "b"(&(run->mmio.data)) :
 +		     "rdx", "memory", "cc");
 +	break;
 +      case 8:
@@ -2696,65 +2709,65 @@ index 0000000..17bee93
 +		     "pushf;"
 +		     "pop %%rax;" :
 +		     "=a"(flags) :
-+		     "a"(kp->vcpu.mmio.ptr), "b"(&(run->mmio.data)) :
++		     "a"(vcpu->mmio.ptr), "b"(&(run->mmio.data)) :
 +		     "rdx", "memory", "cc");
 +	break;
 +      }
-+      kvm_hw->get_regs(kp->hw_data, &r);
++      kvm_hw->get_regs(vcpu->hw_data, &r);
 +      r.rflags &= KVM_FLAGS_CLR_MASK;
 +      r.rflags |= (flags & KVM_FLAGS_SET_MASK);
-+      kvm_hw->set_regs(kp->hw_data, &r);
-+      if (kp->vcpu.mmio.flag & KVM_MMIO_TO_MMIO)
++      kvm_hw->set_regs(vcpu->hw_data, &r);
++      if (vcpu->mmio.flag & KVM_MMIO_TO_MMIO)
 +      {
-+	*(u_int64_t *)&(run->mmio.data) = kp->vcpu.mmio.ptr2;
++	*(u_int64_t *)&(run->mmio.data) = vcpu->mmio.ptr2;
 +	run->mmio.is_write = 1;
-+	kp->vcpu.mmio.dir = 1;
-+	kp->vcpu.mmio.flag = KVM_MMIO_MOV | KVM_MMIO_EN;
++	vcpu->mmio.dir = 1;
++	vcpu->mmio.flag = KVM_MMIO_MOV | KVM_MMIO_EN;
 +	run->exit_reason = KVM_EXIT_MMIO;
 +	return (0);
 +      }
 +      break;
 +      
 +    case KVM_MMIO_EN | KVM_MMIO_MOV: // MOV
-+      switch (kp->vcpu.mmio.size)
++      switch (vcpu->mmio.size)
 +      {
 +      case 1:
-+	*(u_int8_t *)(kp->vcpu.mmio.ptr) = *(u_int8_t *)(&(run->mmio.data));
++	*(u_int8_t *)(vcpu->mmio.ptr) = *(u_int8_t *)(&(run->mmio.data));
 +	break;
 +      case 2:
-+	*(u_int16_t *)(kp->vcpu.mmio.ptr) = *(u_int16_t *)(&(run->mmio.data));
++	*(u_int16_t *)(vcpu->mmio.ptr) = *(u_int16_t *)(&(run->mmio.data));
 +	break;
 +      case 4:
-+	*(u_int32_t *)(kp->vcpu.mmio.ptr) = *(u_int32_t *)(&(run->mmio.data));
++	*(u_int32_t *)(vcpu->mmio.ptr) = *(u_int32_t *)(&(run->mmio.data));
 +	break;
 +      case 8:
-+	*(u_int64_t *)(kp->vcpu.mmio.ptr) = *(u_int64_t *)(&(run->mmio.data));
++	*(u_int64_t *)(vcpu->mmio.ptr) = *(u_int64_t *)(&(run->mmio.data));
 +	break;
 +      }
 +      break;
 +
 +    case KVM_MMIO_EN | KVM_MMIO_MOV | KVM_MMIO_TO_MMIO: // MOV
-+      run->mmio.phys_addr = kp->vcpu.mmio.ptr2;
-+      run->mmio.len = kp->vcpu.mmio.size;
++      run->mmio.phys_addr = vcpu->mmio.ptr2;
++      run->mmio.len = vcpu->mmio.size;
 +      run->mmio.is_write = 1;
-+      kp->vcpu.mmio.dir = 1;
-+      kp->vcpu.mmio.flag = KVM_MMIO_MOV | KVM_MMIO_EN;
++      vcpu->mmio.dir = 1;
++      vcpu->mmio.flag = KVM_MMIO_MOV | KVM_MMIO_EN;
 +      run->exit_reason = KVM_EXIT_MMIO;
 +      return (0);
 +
 +    default:
-+      printf("KVM: unknown flags for MMIO operation: %x\n", kp->vcpu.mmio.flag);
++      printf("KVM: unknown flags for MMIO operation: %x\n", vcpu->mmio.flag);
 +      return (-ENXIO);
 +      break;
 +    }
 +  }
 +  else
-+    if (kp->vcpu.mmio.flag & KVM_MMIO_TO_MMIO)
++    if (vcpu->mmio.flag & KVM_MMIO_TO_MMIO)
 +    {
 +      printf("KVM: ERR userland did not fulfill MMIO MOVSB access\n");
 +      return (-ENXIO);
 +    }
-+  kp->vcpu.mmio.flag = KVM_MMIO_MOV;
++  vcpu->mmio.flag = KVM_MMIO_MOV;
 +  
 +  return (0);
 +}
@@ -2762,6 +2775,7 @@ index 0000000..17bee93
 +// IOCTL
 +int kvmioctl(dev_t dev, u_long cmd, caddr_t addr, int flag, struct proc *p)
 +{
++  struct kvm_vcpu *vcpu = curproc->p_kvm_vcpu;
 +  struct kvm_p *kp = p->p_p->ps_mainproc->p_kvm;
 +  u_int64_t ret;
 +
@@ -2771,6 +2785,8 @@ index 0000000..17bee93
 +  switch (minor(dev))
 +  {
 +  case 0: // /dev/kvm
++    if (!kp)
++      return (-ENODEV);
 +    switch (cmd)
 +    {
 +    case KVM_GET_API_VERSION:
@@ -2791,6 +2807,8 @@ index 0000000..17bee93
 +    }
 +    
 +  case 1: // /dev/kvm_vm
++    if (!kp)
++      return (-ENODEV);
 +    switch (cmd)
 +    {
 +    case KVM_SET_TSS_ADDR:
@@ -2816,31 +2834,33 @@ index 0000000..17bee93
 +    }
 +    
 +  case 2: // /dev/kvm_vcpu
++    if (!kp || !(curproc->p_kvm_vcpu) || kp->shutdown)
++      return (-ENODEV);
 +    switch (cmd)
 +    {
 +    case KVM_SET_CPUID2:
 +      if (((struct kvm_cpuid2 *)addr)->nent > 32)
 +	return (-ENOMEM);
-+      memcpy(&(kp->vcpu.cpuid), addr, sizeof(kp->vcpu.cpuid));
++      memcpy(&(vcpu->cpuid), addr, sizeof(vcpu->cpuid));
 +      return (0);
 +    case KVM_SET_SIGNAL_MASK:
 +      return (0);
 +    case KVM_GET_REGS:
-+      return (kvm_hw->get_regs(kp->hw_data, (struct kvm_regs *)addr));
++      return (kvm_hw->get_regs(vcpu->hw_data, (struct kvm_regs *)addr));
 +    case KVM_SET_REGS:
-+      return (kvm_hw->set_regs(kp->hw_data, (struct kvm_regs *)addr));
++      return (kvm_hw->set_regs(vcpu->hw_data, (struct kvm_regs *)addr));
 +    case KVM_GET_FPU:
-+      return (kvm_hw->get_fpu(kp->hw_data, (struct kvm_fpu *)addr));
++      return (kvm_hw->get_fpu(vcpu->hw_data, (struct kvm_fpu *)addr));
 +    case KVM_SET_FPU:
-+      return (kvm_hw->set_fpu(kp->hw_data, (struct kvm_fpu *)addr));
++      return (kvm_hw->set_fpu(vcpu->hw_data, (struct kvm_fpu *)addr));
 +    case KVM_GET_SREGS:
-+      return (kvm_hw->get_sregs(kp->hw_data, (struct kvm_sregs *)addr, kp));
++      return (kvm_hw->get_sregs(vcpu->hw_data, (struct kvm_sregs *)addr, kp));
 +    case KVM_SET_SREGS:
-+      return (kvm_hw->set_sregs(kp->hw_data, (struct kvm_sregs *)addr, kp));
++      return (kvm_hw->set_sregs(vcpu->hw_data, (struct kvm_sregs *)addr, kp));
 +    case KVM_GET_MSRS:
-+      return (kvm_hw->get_msrs(kp->hw_data, (struct kvm_msrs *)addr));
++      return (kvm_hw->get_msrs(vcpu->hw_data, (struct kvm_msrs *)addr));
 +    case KVM_SET_MSRS:
-+      return (kvm_hw->set_msrs(kp->hw_data, (struct kvm_msrs *)addr));
++      return (kvm_hw->set_msrs(vcpu->hw_data, (struct kvm_msrs *)addr));
 +    case KVM_GET_MP_STATE:
 +      ((struct kvm_mp_state *)addr)->mp_state = KVM_MP_STATE_RUNNABLE;
 +      return (0);
@@ -2848,42 +2868,42 @@ index 0000000..17bee93
 +      return (0);
 +    case KVM_RUN:
 +      // handle MMIO access from userland
-+      if (kp->vcpu.mmio.flag & KVM_MMIO_EN)
++      if (vcpu->mmio.flag & KVM_MMIO_EN)
 +      {
-+	if ((ret = kvm_handle_pre_mmio(kp->vcpu.kr, kp)))
++	if ((ret = kvm_handle_pre_mmio(vcpu->kr, kp)))
 +	  return (ret);
 +	// MMIO to MMIO
-+	if (kp->vcpu.mmio.flag & KVM_MMIO_EN)
++	if (vcpu->mmio.flag & KVM_MMIO_EN)
 +	  return (0);
 +      }
 +      // handle IO operation from userland
-+      if (kp->vcpu.io.flag & 1)
++      if (vcpu->io.flag & 1)
 +      {
-+	if ((ret = kvm_handle_pre_io(kp->vcpu.kr, kp)) < 0)
++	if ((ret = kvm_handle_pre_io(vcpu->kr, kp)) < 0)
 +	  return (ret);
 +	if (ret == 1)
 +	{
-+	  kvm_handle_io(kp->hw_data, kp->vcpu.kr, kp,
-+			sizeof(kp->vcpu.kr->s));
++	  kvm_handle_io(vcpu->hw_data, vcpu->kr, kp,
++			sizeof(vcpu->kr->s));
 +	  return (0);
 +	}
 +      }
 +      // run
-+      ret = kvm_hw->run(kp->hw_data, kp->vcpu.kr, kp, p);
++      ret = kvm_hw->run(vcpu->hw_data, vcpu->kr, kp, p);
 +      // handle MMIO access to userland
-+      if (kp->vcpu.kr->exit_reason == KVM_EXIT_MMIO)
-+	kvm_handle_mmio(kp->vcpu.kr, kp);
++      if (vcpu->kr->exit_reason == KVM_EXIT_MMIO)
++	kvm_handle_mmio(vcpu->kr, kp);
 +      // handle IO operation to userland
-+      if (kp->vcpu.kr->exit_reason == KVM_EXIT_IO)
-+	kvm_handle_io(kp->hw_data, kp->vcpu.kr, kp, 0);
++      if (vcpu->kr->exit_reason == KVM_EXIT_IO)
++	kvm_handle_io(vcpu->hw_data, vcpu->kr, kp, 0);
 +      // update lapic base
-+      kp->vcpu.kr->apic_base = kp->vcpu.lapic;
++      vcpu->kr->apic_base = vcpu->lapic;
 +      return (ret);
 +    case KVM_INTERRUPT:
-+      return (kvm_hw->set_intr(kp->hw_data,
++      return (kvm_hw->set_intr(vcpu->hw_data,
 +			       ((struct kvm_interrupt *)addr)->irq));
 +    case KVM_NMI:
-+      return (kvm_hw->set_intr(kp->hw_data, 0xffffffff));
++      return (kvm_hw->set_intr(vcpu->hw_data, 0xffffffff));
 +    default:
 +      printf("KVM: unhandled vcpu cmd: %lu\n", cmd);
 +      return (-ENOTTY);
@@ -2895,7 +2915,7 @@ index 0000000..17bee93
 +}
 diff --git a/sys/arch/amd64/amd64/svm.c b/sys/arch/amd64/amd64/svm.c
 new file mode 100644
-index 0000000..10396c3
+index 0000000..1ca67c9
 --- /dev/null
 +++ b/sys/arch/amd64/amd64/svm.c
 @@ -0,0 +1,1141 @@
@@ -2945,7 +2965,7 @@ index 0000000..10396c3
 +// lock
 +struct mutex svm_mutex;
 +
-+// initialize a new VM
++// initialize a new CPU
 +struct v_svm *svm_init(struct proc *p)
 +{
 +  struct v_svm_vpage *v;
@@ -2980,7 +3000,7 @@ index 0000000..10396c3
 +  return (svm);
 +}
 +
-+// free a VM
++// free a CPU
 +void svm_free(struct v_svm *svm)
 +{
 +  struct v_svm_vpage *v;
@@ -3298,7 +3318,7 @@ index 0000000..10396c3
 +  // EFER
 +  s->efer = svm->vmcb->efer;
 +  // APIC-access
-+  s->apic_base = kp->vcpu.lapic;
++  s->apic_base = curproc->p_kvm_vcpu->lapic;
 +  // interrupts
 +  s->interrupt_bitmap[0] = svm->intr[0];
 +  s->interrupt_bitmap[1] = svm->intr[1];
@@ -3421,7 +3441,7 @@ index 0000000..10396c3
 +  // EFER
 +  svm->vmcb->efer = s->efer;
 +  // APIC-access
-+  kp->vcpu.lapic = s->apic_base;
++  curproc->p_kvm_vcpu->lapic = s->apic_base;
 +  // interrupts
 +  svm->intr[0] = s->interrupt_bitmap[0];
 +  svm->intr[1] = s->interrupt_bitmap[1];
@@ -3690,7 +3710,7 @@ index 0000000..10396c3
 +    run->if_flag = (svm->vmcb->rflags & ((u_int64_t)1 << 9)) ? 1 : 0;
 +    run->flags = 0;
 +    run->request_interrupt_window = 0;
-+    kp->vcpu.insn_len = 0;
++    p->p_kvm_vcpu->insn_len = 0;
 +    return (0);
 +  }
 +
@@ -3727,10 +3747,10 @@ index 0000000..10396c3
 +  wrmsr(SVM_HSAVE_PA, p->p_cpu->ci_svm->phost);
 +  
 +  // if insn_len is set, we have to advance RIP
-+  if (kp->vcpu.insn_len)
++  if (p->p_kvm_vcpu->insn_len)
 +  {
-+    svm->vmcb->rip += kp->vcpu.insn_len;
-+    kp->vcpu.insn_len = 0;
++    svm->vmcb->rip += p->p_kvm_vcpu->insn_len;
++    p->p_kvm_vcpu->insn_len = 0;
 +  }
 +  
 +  // restore guest FPU/MMX/SSE...
@@ -3878,7 +3898,7 @@ index 0000000..10396c3
 +  
 +  // default KVM exit reason
 +  run->exit_reason = KVM_EXIT_IRQ_WINDOW_OPEN;
-+  kp->vcpu.insn_len = 0;
++  p->p_kvm_vcpu->insn_len = 0;
 +  switch (svm->vmcb->exit_code)
 +  {
 +  case SVM_EXIT_INTR:             // external interrupt
@@ -3889,30 +3909,30 @@ index 0000000..10396c3
 +    
 +  case SVM_EXIT_CPUID:            // CPUID
 +    if ((svm->vmcb->rax == 4) || (svm->vmcb->rax == 0xb))
-+      i = kp->vcpu.cpuid.nent;
++      i = p->p_kvm_vcpu->cpuid.nent;
 +    else
-+      for (i = 0; i < kp->vcpu.cpuid.nent; i++)
-+	if (kp->vcpu.cpuid.entries[i].function == svm->vmcb->rax)
++      for (i = 0; i < p->p_kvm_vcpu->cpuid.nent; i++)
++	if (p->p_kvm_vcpu->cpuid.entries[i].function == svm->vmcb->rax)
 +	{
-+	  svm->vmcb->rax = kp->vcpu.cpuid.entries[i].eax;
-+	  svm->guest.rbx = kp->vcpu.cpuid.entries[i].ebx;
-+	  svm->guest.rcx = kp->vcpu.cpuid.entries[i].ecx;
-+	  svm->guest.rdx = kp->vcpu.cpuid.entries[i].edx;
++	  svm->vmcb->rax = p->p_kvm_vcpu->cpuid.entries[i].eax;
++	  svm->guest.rbx = p->p_kvm_vcpu->cpuid.entries[i].ebx;
++	  svm->guest.rcx = p->p_kvm_vcpu->cpuid.entries[i].ecx;
++	  svm->guest.rdx = p->p_kvm_vcpu->cpuid.entries[i].edx;
 +	  break;
 +	}
-+    if (i == kp->vcpu.cpuid.nent)
++    if (i == p->p_kvm_vcpu->cpuid.nent)
 +    {
 +      svm->vmcb->rax = 0;
 +      svm->guest.rbx = 0;
 +      svm->guest.rcx = 0;
 +      svm->guest.rdx = 0;
 +    }
-+    kp->vcpu.insn_len = 2;
++    p->p_kvm_vcpu->insn_len = 2;
 +    break;
 +    
 +  case SVM_EXIT_HLT:              // HLT
 +    run->exit_reason = KVM_EXIT_HLT;
-+    kp->vcpu.insn_len = 1;
++    p->p_kvm_vcpu->insn_len = 1;
 +    break;
 +    
 +  case SVM_EXIT_VMMCALL:          // hypercall
@@ -3924,7 +3944,7 @@ index 0000000..10396c3
 +    run->hypercall.args[3] = svm->guest.rsi;
 +    run->hypercall.args[4] = 0;
 +    run->hypercall.args[5] = 0;
-+    kp->vcpu.insn_len = 3;
++    p->p_kvm_vcpu->insn_len = 3;
 +    break;
 +
 +  case SVM_EXIT_IOIO:             // I/O port access
@@ -3935,15 +3955,15 @@ index 0000000..10396c3
 +    run->io.port = (svm->vmcb->exit_info1 >> 16) & 0xffff;
 +    // offset in kvm_run struct
 +    run->io.data_offset = offsetof(struct kvm_run, s);
-+    kp->vcpu.io.dir = run->io.direction;
-+    kp->vcpu.io.size = run->io.size;
-+    kp->vcpu.insn_len = svm->vmcb->exit_info2 - svm->vmcb->rip;
-+    kp->vcpu.io.user_ptr = (void *)(((vaddr_t)run) + run->io.data_offset);
-+    kp->vcpu.io.flag = 1;
-+    kp->vcpu.io.rep = (svm->vmcb->exit_info1 >> 3) & 1;
-+    kp->vcpu.io.str = (svm->vmcb->exit_info1 >> 2) & 1;
-+    kp->vcpu.io.addr_size = ((svm->vmcb->exit_info1 >> 7) & 0b111) * 2;
-+    kp->vcpu.io.seg = (svm->vmcb->exit_info1 >> 10) & 0b111;
++    p->p_kvm_vcpu->io.dir = run->io.direction;
++    p->p_kvm_vcpu->io.size = run->io.size;
++    p->p_kvm_vcpu->insn_len = svm->vmcb->exit_info2 - svm->vmcb->rip;
++    p->p_kvm_vcpu->io.user_ptr = (void *)(((vaddr_t)run) + run->io.data_offset);
++    p->p_kvm_vcpu->io.flag = 1;
++    p->p_kvm_vcpu->io.rep = (svm->vmcb->exit_info1 >> 3) & 1;
++    p->p_kvm_vcpu->io.str = (svm->vmcb->exit_info1 >> 2) & 1;
++    p->p_kvm_vcpu->io.addr_size = ((svm->vmcb->exit_info1 >> 7) & 0b111) * 2;
++    p->p_kvm_vcpu->io.seg = (svm->vmcb->exit_info1 >> 10) & 0b111;
 +    break;
 +    
 +  case SVM_EXIT_MSR:              // MSR access
@@ -3953,11 +3973,11 @@ index 0000000..10396c3
 +    case MSR_APICBASE:
 +      if (!svm->vmcb->exit_info1)
 +      {
-+	svm->vmcb->rax = kp->vcpu.lapic & 0xffffffff;
-+	svm->guest.rdx = kp->vcpu.lapic >> 32;
++	svm->vmcb->rax = p->p_kvm_vcpu->lapic & 0xffffffff;
++	svm->guest.rdx = p->p_kvm_vcpu->lapic >> 32;
 +      }
 +      else
-+	kp->vcpu.lapic = (svm->vmcb->rax & 0xffffffff)
++	p->p_kvm_vcpu->lapic = (svm->vmcb->rax & 0xffffffff)
 +	  | (svm->guest.rdx << 32);
 +      break;
 +    case MSR_EFER:
@@ -3980,13 +4000,13 @@ index 0000000..10396c3
 +	svm->guest.rdx = 0;
 +      }
 +    }
-+    kp->vcpu.insn_len = 2;
++    p->p_kvm_vcpu->insn_len = 2;
 +    break;
 +    
 +  case SVM_EXIT_NPF:              // MMIO
 +    run->exit_reason = KVM_EXIT_MMIO;
-+    kp->vcpu.mmio.gpaddr = svm->vmcb->exit_info2;
-+    kp->vcpu.mmio.acc =
++    p->p_kvm_vcpu->mmio.gpaddr = svm->vmcb->exit_info2;
++    p->p_kvm_vcpu->mmio.acc =
 +      ((svm->vmcb->exit_info1 & 1) ? 1 : 0) |
 +      ((svm->vmcb->exit_info1 & ((u_int64_t)1 << 1)) ? 0b10 : 0) |
 +      ((svm->vmcb->exit_info1 & ((u_int64_t)1 << 4)) ? 0b100 : 0);
@@ -4042,7 +4062,7 @@ index 0000000..10396c3
 +}
 diff --git a/sys/arch/amd64/amd64/vmx.c b/sys/arch/amd64/amd64/vmx.c
 new file mode 100644
-index 0000000..594b63a
+index 0000000..4402e4f
 --- /dev/null
 +++ b/sys/arch/amd64/amd64/vmx.c
 @@ -0,0 +1,1773 @@
@@ -4185,7 +4205,7 @@ index 0000000..594b63a
 +  return (ret);
 +}
 +
-+// initialize a new VM
++// initialize a new CPU
 +struct v_vmx *vmx_init(struct proc *p)
 +{
 +  struct v_vmx_vpage *v;
@@ -4254,7 +4274,7 @@ index 0000000..594b63a
 +  return (vmx);
 +}
 +
-+// free a VM
++// free a CPU
 +void vmx_free(struct v_vmx *vmx)
 +{
 +  struct v_vmx_vpage *v;
@@ -4677,7 +4697,7 @@ index 0000000..594b63a
 +  // EFER
 +  ret |= vmx_vmread(VMX_VMCS_REG_IA32_EFER, &s->efer);
 +  // APIC-access
-+  s->apic_base = kp->vcpu.lapic;
++  s->apic_base = curproc->p_kvm_vcpu->lapic;
 +  // interrupts
 +  s->interrupt_bitmap[0] = vmx->intr[0];
 +  s->interrupt_bitmap[1] = vmx->intr[1];
@@ -4875,7 +4895,7 @@ index 0000000..594b63a
 +  // EFER
 +  ret |= vmx_vmwrite(VMX_VMCS_REG_IA32_EFER, s->efer);
 +  // APIC-access
-+  kp->vcpu.lapic = s->apic_base;
++  curproc->p_kvm_vcpu->lapic = s->apic_base;
 +  // interrupts
 +  vmx->intr[0] = s->interrupt_bitmap[0];
 +  vmx->intr[1] = s->interrupt_bitmap[1];
@@ -5374,11 +5394,11 @@ index 0000000..594b63a
 +  KERNEL_UNLOCK();
 +
 +  // if insn_len is set, we have to advance RIP
-+  if (kp->vcpu.insn_len)
++  if (p->p_kvm_vcpu->insn_len)
 +  {
 +    vmx_vmread(VMX_VMCS_REG_RIP, &exit);
-+    vmx_vmwrite(VMX_VMCS_REG_RIP, exit + kp->vcpu.insn_len);
-+    kp->vcpu.insn_len = 0;
++    vmx_vmwrite(VMX_VMCS_REG_RIP, exit + p->p_kvm_vcpu->insn_len);
++    p->p_kvm_vcpu->insn_len = 0;
 +  }
 +  
 +  // restore guest FPU/MMX/SSE...
@@ -5529,30 +5549,30 @@ index 0000000..594b63a
 +      
 +    case VMX_REASON_CPUID: // CPUID
 +      if ((vmx->guest.rax == 4) || (vmx->guest.rax == 0xb))
-+	i = kp->vcpu.cpuid.nent;
++	i = p->p_kvm_vcpu->cpuid.nent;
 +      else
-+	for (i = 0; i < kp->vcpu.cpuid.nent; i++)
-+	  if (kp->vcpu.cpuid.entries[i].function == vmx->guest.rax)
++	for (i = 0; i < p->p_kvm_vcpu->cpuid.nent; i++)
++	  if (p->p_kvm_vcpu->cpuid.entries[i].function == vmx->guest.rax)
 +	  {
-+	    vmx->guest.rax = kp->vcpu.cpuid.entries[i].eax;
-+	    vmx->guest.rbx = kp->vcpu.cpuid.entries[i].ebx;
-+	    vmx->guest.rcx = kp->vcpu.cpuid.entries[i].ecx;
-+	    vmx->guest.rdx = kp->vcpu.cpuid.entries[i].edx;
++	    vmx->guest.rax = p->p_kvm_vcpu->cpuid.entries[i].eax;
++	    vmx->guest.rbx = p->p_kvm_vcpu->cpuid.entries[i].ebx;
++	    vmx->guest.rcx = p->p_kvm_vcpu->cpuid.entries[i].ecx;
++	    vmx->guest.rdx = p->p_kvm_vcpu->cpuid.entries[i].edx;
 +	    break;
 +	  }
-+      if (i == kp->vcpu.cpuid.nent)
++      if (i == p->p_kvm_vcpu->cpuid.nent)
 +      {
 +	vmx->guest.rax = 0;
 +	vmx->guest.rbx = 0;
 +	vmx->guest.rcx = 0;
 +	vmx->guest.rdx = 0;
 +      }
-+      kp->vcpu.insn_len = 2;
++      p->p_kvm_vcpu->insn_len = 2;
 +      break;
 +
 +    case VMX_REASON_HLT: // HLT
 +      run->exit_reason = KVM_EXIT_HLT;
-+      kp->vcpu.insn_len = 1;
++      p->p_kvm_vcpu->insn_len = 1;
 +      break;
 +      
 +    case VMX_REASON_VMCALL: // hypercall
@@ -5564,7 +5584,7 @@ index 0000000..594b63a
 +      run->hypercall.args[3] = vmx->guest.rsi;
 +      run->hypercall.args[4] = 0;
 +      run->hypercall.args[5] = 0;
-+      kp->vcpu.insn_len = 3;
++      p->p_kvm_vcpu->insn_len = 3;
 +      break;
 +      
 +    case VMX_REASON_IO_INSN: // I/O port access
@@ -5575,38 +5595,38 @@ index 0000000..594b63a
 +      run->io.port = (qual >> 16) & 0xffff;
 +      // offset in kvm_run struct
 +      run->io.data_offset = offsetof(struct kvm_run, s);
-+      kp->vcpu.io.dir = run->io.direction;
-+      kp->vcpu.io.size = run->io.size;
-+      vmx_vmread(VMX_VMCS_EXIT_INSN_LEN, &(kp->vcpu.insn_len));
-+      kp->vcpu.io.user_ptr = (void *)(((vaddr_t)run) + run->io.data_offset);
-+      kp->vcpu.io.flag = 1;
-+      kp->vcpu.io.rep = (qual >> 5) & 1;
-+      kp->vcpu.io.str = (qual >> 4) & 1;
++      p->p_kvm_vcpu->io.dir = run->io.direction;
++      p->p_kvm_vcpu->io.size = run->io.size;
++      vmx_vmread(VMX_VMCS_EXIT_INSN_LEN, &(p->p_kvm_vcpu->insn_len));
++      p->p_kvm_vcpu->io.user_ptr = (void *)(((vaddr_t)run) + run->io.data_offset);
++      p->p_kvm_vcpu->io.flag = 1;
++      p->p_kvm_vcpu->io.rep = (qual >> 5) & 1;
++      p->p_kvm_vcpu->io.str = (qual >> 4) & 1;
 +      vmx_vmread(VMX_VMCS_EXIT_INSN_INF, &qual);
-+      kp->vcpu.io.seg = (qual >> 15) & 0b111;
++      p->p_kvm_vcpu->io.seg = (qual >> 15) & 0b111;
 +      qual = (qual >> 7) & 0b111;
 +      switch (qual)
 +      {
 +      case 1:
-+	kp->vcpu.io.addr_size = 4;
++	p->p_kvm_vcpu->io.addr_size = 4;
 +	break;
 +      case 2:
-+	kp->vcpu.io.addr_size = 8;
++	p->p_kvm_vcpu->io.addr_size = 8;
 +	break;
 +      default:
-+	kp->vcpu.io.addr_size = 2;
++	p->p_kvm_vcpu->io.addr_size = 2;
 +	break;
 +      }
 +      break;
 +      
 +    case VMX_REASON_RDMSR: // MSR read
-+      vmx_vmread(VMX_VMCS_EXIT_INSN_LEN, &(kp->vcpu.insn_len));
++      vmx_vmread(VMX_VMCS_EXIT_INSN_LEN, &(p->p_kvm_vcpu->insn_len));
 +      qual = vmx->guest.rcx & 0xffffffff;
 +      switch (qual)
 +      {
 +      case MSR_APICBASE:
-+	vmx->guest.rax = kp->vcpu.lapic & 0xffffffff;
-+	vmx->guest.rdx = kp->vcpu.lapic >> 32;
++	vmx->guest.rax = p->p_kvm_vcpu->lapic & 0xffffffff;
++	vmx->guest.rdx = p->p_kvm_vcpu->lapic >> 32;
 +	break;
 +      default:
 +	vmx->guest.rax = 0;
@@ -5616,14 +5636,14 @@ index 0000000..594b63a
 +      break;
 +      
 +    case VMX_REASON_WRMSR: // MSR write
-+      vmx_vmread(VMX_VMCS_EXIT_INSN_LEN, &(kp->vcpu.insn_len));
++      vmx_vmread(VMX_VMCS_EXIT_INSN_LEN, &(p->p_kvm_vcpu->insn_len));
 +      qual = vmx->guest.rcx & 0xffffffff;
 +      val = vmx->guest.rax & 0xffffffff;
 +      val |= vmx->guest.rdx >> 32;
 +      switch (qual)
 +      {
 +      case MSR_APICBASE:
-+	kp->vcpu.lapic = (vmx->guest.rax & 0xffffffff)
++	p->p_kvm_vcpu->lapic = (vmx->guest.rax & 0xffffffff)
 +	  | (vmx->guest.rdx << 32);
 +	break;
 +      }
@@ -5631,9 +5651,9 @@ index 0000000..594b63a
 +      
 +    case VMX_REASON_EPT_FAULT: // EPT fault
 +      run->exit_reason = KVM_EXIT_MMIO;
-+      vmx_vmread(VMX_VMCS_GUEST_PHYS, &(kp->vcpu.mmio.gpaddr));
++      vmx_vmread(VMX_VMCS_GUEST_PHYS, &(p->p_kvm_vcpu->mmio.gpaddr));
 +      vmx_vmread(VMX_VMCS_EXIT_QUALIF, &qual);
-+      kp->vcpu.mmio.acc =
++      p->p_kvm_vcpu->mmio.acc =
 +	((qual & (1 << 3)) ? 1 : 0) |
 +	((qual & (1 << 1)) ? 0b10 : 0) |
 +	((qual & (1 << 2)) ? 0b100 : 0);
@@ -5755,7 +5775,7 @@ index 0000000..594b63a
 +	run->hw.hardware_exit_reason = exit;
 +	break;
 +      }
-+      vmx_vmread(VMX_VMCS_EXIT_INSN_LEN, &(kp->vcpu.insn_len));
++      vmx_vmread(VMX_VMCS_EXIT_INSN_LEN, &(p->p_kvm_vcpu->insn_len));
 +      break;
 +      
 +    default:
@@ -5873,10 +5893,10 @@ index 809766a..e28f075 100644
  #define CPUF_BSP	0x0001		/* CPU is the original BSP */
 diff --git a/sys/arch/amd64/include/kvm.h b/sys/arch/amd64/include/kvm.h
 new file mode 100644
-index 0000000..07eed83
+index 0000000..9233fc3
 --- /dev/null
 +++ b/sys/arch/amd64/include/kvm.h
-@@ -0,0 +1,1042 @@
+@@ -0,0 +1,1044 @@
 +#ifndef _MACHINE_KVM_H_
 +#define _MACHINE_KVM_H_
 +
@@ -6504,13 +6524,13 @@ index 0000000..07eed83
 +
 +struct kvm_vcpu
 +{
-+  int created;
 +  struct kvm_cpuid2 cpuid;
 +  struct kvm_run *kr;
 +  paddr_t lapic;
 +  struct v_io io;
 +  struct v_mmio mmio;
 +  u_int64_t insn_len;
++  void *hw_data;
 +};
 +
 +struct kvm_guest_mem
@@ -6533,14 +6553,16 @@ index 0000000..07eed83
 +
 +struct kvm_p
 +{
-+  struct kvm_vcpu vcpu;
++  struct kvm_vcpu *vcpu[16];
 +  struct kvm_guest_mem mem[32];
 +  vaddr_t vpml4;
 +  paddr_t ppml4;
 +  SLIST_HEAD(v_kvm_head, v_kvm_vpage) vp;
-+  void *hw_data;
 +  int created;
 +  int id;
++  struct mutex vcpu_mtx;
++  u_int16_t vcpu_count;
++  int shutdown;
 +  paddr_t identity_base;
 +  paddr_t tss_base;
 +};
@@ -7485,7 +7507,7 @@ index 0000000..c85422f
 +
 +#endif /* !_MACHINE_VMX_H_ */
 diff --git a/sys/sys/proc.h b/sys/sys/proc.h
-index 7c3b7f0..ceae2e5 100644
+index 7c3b7f0..8ded73c 100644
 --- a/sys/sys/proc.h
 +++ b/sys/sys/proc.h
 @@ -270,6 +270,10 @@ struct process {
@@ -7499,12 +7521,13 @@ index 7c3b7f0..ceae2e5 100644
  
  struct proc {
  	TAILQ_ENTRY(proc) p_runq;
-@@ -318,6 +322,9 @@ struct proc {
+@@ -318,6 +322,10 @@ struct proc {
  	void	*p_emuldata;		/* Per-process emulation data, or */
  					/* NULL. Malloc type M_EMULDATA */
  	int	 p_siglist;		/* Signals arrived but not delivered. */
 +#ifdef __amd64__
 +        struct  kvm_p *p_kvm;
++        struct  kvm_vcpu *p_kvm_vcpu;
 +#endif
  
  /* End area that is zeroed on creation. */

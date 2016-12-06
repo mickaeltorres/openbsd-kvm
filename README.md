@@ -19,12 +19,14 @@ The following guests have been tested:
  - Windows 10 (1607 x64): iso boots, install starts, then BSOD
 
 Known caveats:
- - only one vCPU supported
+ - ~~only one vCPU supported~~ very crude smp without mutexes / expect a lot of race conditions when running -smp > 1
  - quick and dirty code :D
  - ~~the IO/MMIO instruction emulation is, at best, a hack~~ getting better
  - ~~sometimes to install debian on intel CPU, it is needed to kill a modprobe btrfs process~~ fixed by disabling AVX for guests until we support xsave/xrstor
  - ~~text and VGA console doesn't refresh well, the culprit would be, IO/MMIO emulation and/or the KVM_GET_DIRTY_LOG ioctl~~ fixed with dirty log patch
  - ~~FreeBSD 11 doesn't work with Q35 chipset~~ instruction enmulation fixes have resolved this
+ - when -smp > 1, the vm may hang or crash in bios or in the guest, smp support is very preliminary
+ - max number of vcpu is hardcoded at 16, and it is the max limit KVM_CAP_MAX_VCPUS is returning, KVM_CAP_NR_VCPUS returns the number of used cores on the host
 
 Compile the kernel with the patch:
 
