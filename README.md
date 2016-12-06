@@ -12,18 +12,19 @@ Has been tested on OpenBSD 6.0-stable on the following CPUs:
 
 The following guests have been tested:
  - OpenBSD 6.0 amd64: installs / works
- - FreeBSD 11.0-RC3 amd64: installs / works without -M q35
+ - FreeBSD 11.0-RC3 amd64: installs / works
  - Debian 8.6.0 amd64: installs / works
  - TinyCore 7.6 i386 non-PAE: installs / works
  - Debian 8.6.0 i386 PAE: installs / works
+ - Windows 10 (1607 x64): iso boots, install starts, then BSOD
 
 Known caveats:
  - only one vCPU supported
  - quick and dirty code :D
- - the IO/MMIO instruction emulation is, at best, a hack
+ - ~~the IO/MMIO instruction emulation is, at best, a hack~~ getting better
  - ~~sometimes to install debian on intel CPU, it is needed to kill a modprobe btrfs process~~ fixed by disabling AVX for guests until we support xsave/xrstor
  - ~~text and VGA console doesn't refresh well, the culprit would be, IO/MMIO emulation and/or the KVM_GET_DIRTY_LOG ioctl~~ fixed with dirty log patch
- - ...
+ - ~~FreeBSD 11 doesn't work with Q35 chipset~~ instruction enmulation fixes have resolved this
 
 Compile the kernel with the patch:
 
@@ -63,4 +64,4 @@ You should be able to start, and install guests like this:
 qemu-system-x86_64 -enable-kvm -cpu host -boot d -cdrom iso -m 512 -netdev user,id=vionet -device virtio-net,netdev=vionet -drive file=disk,if=virtio,format=raw -M q35
 ```
 
-Adapt as you see fit, FreeBSD is known to panic with -M q35, so remove this for that type of guests
+Adapt as you see fit
